@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Sure Bank Sync</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <span class="logo">⬡</span>
+    <span class="header-title">Sure Bank Sync</span>
+  </div>
+  <div class="header-right">
+    <button id="refresh-btn" title="Refresh Sure accounts">↻</button>
+    <button id="settings-btn" title="Settings">⚙</button>
+    <button id="sync-btn" style="display:none">Sync Now</button>
+  </div>
+</header>
+
+<div id="status-bar">Not synced yet</div>
+
+<!-- Accounts view -->
+<div id="accounts-view" style="display:none">
+  <div id="sync-summary">
+    <div id="summary-net-worth-row">
+      <span class="summary-net-worth-label">Net worth</span>
+      <div class="summary-net-worth-value-row">
+        <span id="summary-net-worth"></span>
+        <span id="summary-net-worth-delta"></span>
+      </div>
+    </div>
+    <div class="summary-secondary">
+      <div id="summary-accounts" class="summary-pill"></div>
+      <div id="summary-transactions" class="summary-stat" style="display:none"></div>
+    </div>
+  </div>
+
+  <div id="sync-from-section" style="display:none">
+    <span class="field-label">
+      Start syncing from
+      <span class="tooltip-icon" title="Applies to accounts that haven't synced yet. Already-synced accounts continue from where they left off.">ⓘ</span>
+    </span>
+    <input id="sync-from-date" type="date" />
+  </div>
+
+  <div id="accounts-list"></div>
+
+  <div id="add-account-area">
+    <button id="add-account-btn">+ Add account</button>
+    <div id="account-type-dropdown"></div>
+  </div>
+</div>
+
+<!-- Settings view -->
+<div id="settings-view" style="display:none">
+  <div class="field-group">
+    <span class="field-label">Sure URL</span>
+    <input id="sure-url" type="url" placeholder="https://your-sure-instance.example.com" />
+  </div>
+  <div class="field-group">
+    <span class="field-label">API Key</span>
+    <input id="sure-api-key" type="password" placeholder="your Sure API key" />
+  </div>
+  <div class="settings-actions">
+    <button id="connect-btn" class="btn btn-primary">Connect</button>
+  </div>
+  <div class="settings-danger">
+    <button id="delete-all-btn" class="btn btn-danger">Delete all transactions</button>
+  </div>
+</div>
+
+<script type="module" src="src/popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,84 @@
+{
+  "manifest_version": 3,
+  "name": "Sure Bank Sync",
+  "version": "1.0.0",
+  "description": "Automatically syncs bank transactions to Sure",
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "cookies"
+  ],
+
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+
+  "host_permissions": [
+    "https://www.sofi.com/*",
+    "https://login.sofi.com/*",
+    "https://*.venmo.com/*",
+    "https://www.bilt.com/*",
+    "https://myaccounts.capitalone.com/*",
+    "https://login.fidelityrewards.com/*",
+    "https://digital.fidelity.com/*",
+    "https://api.usbank.com/*",
+    "https://mytargetcirclecard.target.com/*",
+    "https://onlinebanking.usbank.com/*",
+    "https://*.wellsfargo.com/*"
+  ],
+
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Sure Bank Sync"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://www.sofi.com/my/banking/*"],
+      "js": ["src/content/content-utils.js", "src/content/sofi.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://account.venmo.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/venmo.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.bilt.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/bilt.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://myaccounts.capitalone.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/capitalone.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://login.fidelityrewards.com/*", "https://digital.fidelity.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/fidelity.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://mytargetcirclecard.target.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/target.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://onlinebanking.usbank.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/usbank.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://connect.secure.wellsfargo.com/*"],
+      "js": ["src/content/content-utils.js", "src/content/wellsfargo.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
