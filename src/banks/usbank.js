@@ -1,12 +1,13 @@
-import { getSyncPlan, pacificDate, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncUSBank(settings, accountMappings, options = {}) {
     console.log("US Bank: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
 
     const allKeys = Object.keys(accountMappings).filter(k => k.startsWith("usbank-"));
     const syncKeys = options.syncKeys?.length ? options.syncKeys : allKeys;
-    const plans = Object.fromEntries(syncKeys.map(k => [k, getSyncPlan(lastSyncDates, syncFromDate, k)]));
+    await seedLastTxDates(lastTxDates, accountMappings, syncKeys);
+    const plans = Object.fromEntries(syncKeys.map(k => [k, getSyncPlan(lastSyncDates, syncFromDate, k, lastTxDates)]));
     const activeKeys = syncKeys.filter(k => plans[k]);
     const tab = await openTabBackground("https://onlinebanking.usbank.com/auth/login/");
     chrome.tabs.update(tab.id, { active: true });
@@ -146,6 +147,7 @@ function pollForUSBankData(tabId, onTick) {
             const elapsed = Date.now() - start;
             if (elapsed > POLL_TIMEOUT_MS) {
                 clearInterval(interval);
+                removeGuard();
                 reject(new Error("Timed out waiting for US Bank data"));
                 return;
             }
@@ -159,12 +161,18 @@ function pollForUSBankData(tabId, onTick) {
                 const result = await chrome.tabs.sendMessage(tabId, { type: "GET_USBANK_DATA" });
                 if (result?.accessToken && result?.accounts?.length > 0) {
                     clearInterval(interval);
+                    removeGuard();
                     resolve(result);
                 }
             } catch {
                 // Tab not ready or content script not loaded yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

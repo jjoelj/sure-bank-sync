@@ -1,9 +1,10 @@
-import { getSyncPlan, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncTarget(settings, accountMappings, accountKey, options = {}) {
     console.log("Target: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
-    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
+    await seedLastTxDates(lastTxDates, accountMappings, [accountKey]);
+    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey, lastTxDates);
     if (!plan) {
         console.warn("Target: no sync start date configured, skipping.");
         return;
@@ -108,6 +109,7 @@ function pollForTargetData(tabId, onTick) {
                 if (!dataPageStart) dataPageStart = Date.now();
                 if (Date.now() - dataPageStart > POLL_TIMEOUT_MS) {
                     clearInterval(interval);
+                    removeGuard();
                     reject(new Error("Timed out waiting for Target data"));
                     return;
                 }
@@ -140,6 +142,7 @@ function pollForTargetData(tabId, onTick) {
 
                 if (bankId && csrfToken) {
                     clearInterval(interval);
+                    removeGuard();
                     resolve({ bankId, csrfToken });
                 } else if (bankId && !csrfToken) {
                     const csrfResult = await chrome.scripting.executeScript({
@@ -151,6 +154,7 @@ function pollForTargetData(tabId, onTick) {
                     const csrfFromSource = csrfResult?.[0]?.result;
                     if (bankId && csrfFromSource) {
                         clearInterval(interval);
+                        removeGuard();
                         resolve({ bankId, csrfToken: csrfFromSource });
                     }
                 }
@@ -160,6 +164,11 @@ function pollForTargetData(tabId, onTick) {
                 busy = false;
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

@@ -162,3 +162,13 @@ export async function getTransactions(accountId, { startDate, endDate } = {}) {
   return all;
 }
 
+export async function getLatestTransactionDate(accountId) {
+  const txs = await getTransactions(accountId);
+  if (txs.length === 0) return null;
+  let maxDate = txs[0].date;
+  for (const tx of txs) {
+    if (tx.date > maxDate) maxDate = tx.date;
+  }
+  return maxDate;
+}
+

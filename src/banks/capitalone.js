@@ -1,12 +1,13 @@
-import { getSyncPlan, pacificDate, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, getDateChunks, subtractOneDay, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, getDateChunks, subtractOneDay, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncCapitalOne(settings, accountMappings, options = {}) {
     console.log("Capital One: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
 
     const allKeys = Object.keys(accountMappings).filter(k => k.startsWith("capitalone-"));
     const syncKeys = options.syncKeys?.length ? options.syncKeys : allKeys;
-    const plans = Object.fromEntries(syncKeys.map(k => [k, getSyncPlan(lastSyncDates, syncFromDate, k)]));
+    await seedLastTxDates(lastTxDates, accountMappings, syncKeys);
+    const plans = Object.fromEntries(syncKeys.map(k => [k, getSyncPlan(lastSyncDates, syncFromDate, k, lastTxDates)]));
     const activeKeys = syncKeys.filter(k => plans[k]);
     const tab = await openTabBackground("https://myaccounts.capitalone.com/accountSummary");
     chrome.tabs.update(tab.id, { active: true });
@@ -90,6 +91,7 @@ function pollForCapitalOneAccounts(tabId, onTick) {
             const elapsed = Date.now() - start;
             if (elapsed > POLL_TIMEOUT_MS) {
                 clearInterval(interval);
+                removeGuard();
                 reject(new Error("Timed out waiting for Capital One accounts"));
                 return;
             }
@@ -113,12 +115,18 @@ function pollForCapitalOneAccounts(tabId, onTick) {
                 const accounts = await fetchCapitalOneAccounts();
                 if (accounts.length > 0) {
                     clearInterval(interval);
+                    removeGuard();
                     resolve(accounts);
                 }
             } catch {
                 // Tab not ready or not logged in yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

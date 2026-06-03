@@ -56,6 +56,7 @@ header {
 }
 
 #refresh-btn,
+#logs-btn,
 #settings-btn {
   background: transparent;
   border: none;
@@ -68,8 +69,10 @@ header {
 }
 
 #refresh-btn:hover,
+#logs-btn:hover,
 #settings-btn:hover  { color: var(--text); background: var(--border); }
-#settings-btn.active { color: var(--accent); }
+#settings-btn.active,
+#logs-btn.active     { color: var(--accent); }
 
 #sync-btn {
   background: var(--accent);
@@ -103,9 +106,76 @@ header {
 
 /* ── Views ── */
 #accounts-view,
-#settings-view {
+#settings-view,
+#logs-view {
   padding: 12px 14px;
 }
+
+/* ── Logs view ── */
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.logs-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+.logs-autoscroll {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.logs-autoscroll input { width: auto; }
+
+#logs-clear-btn { padding: 3px 10px; font-size: 11px; }
+
+#logs-output {
+  height: 380px;
+  overflow-y: auto;
+  background: #05050c;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.45;
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent) transparent;
+}
+
+#logs-output::-webkit-scrollbar { width: 6px; }
+#logs-output::-webkit-scrollbar-track { background: transparent; }
+#logs-output::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--border-light), var(--accent));
+  border-radius: 999px;
+}
+
+.log-line {
+  display: flex;
+  gap: 7px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 1px 0;
+}
+
+.log-time { color: var(--text-dim); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.log-msg  { color: var(--text-muted); min-width: 0; }
+.log-line.warn  .log-msg { color: #f0b429; }
+.log-line.error .log-msg { color: var(--error); }
+
+.logs-empty { color: var(--text-dim); font-style: italic; }
 
 #accounts-view {
   display: flex;

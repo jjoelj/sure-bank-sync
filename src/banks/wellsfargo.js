@@ -1,9 +1,10 @@
-import { getSyncPlan, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncWellsFargo(settings, accountMappings, accountKey, options = {}) {
     console.log("Wells Fargo: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
-    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
+    await seedLastTxDates(lastTxDates, accountMappings, [accountKey]);
+    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey, lastTxDates);
     if (!plan) {
         console.warn("WF: no sync start date configured, skipping.");
         return;
@@ -117,6 +118,7 @@ function pollForWFData(tabId, wfAccountId, onTick) {
                 if (!dataPageStart) dataPageStart = Date.now();
                 if (Date.now() - dataPageStart > POLL_TIMEOUT_MS) {
                     clearInterval(interval);
+                    removeGuard();
                     reject(new Error("Timed out waiting for WF data"));
                     return;
                 }
@@ -170,6 +172,7 @@ function pollForWFData(tabId, wfAccountId, onTick) {
                     const accountId = urlObj.searchParams.get("accountId") ?? wfAccountId;
                     if (xatoken && accountId) {
                         clearInterval(interval);
+                        removeGuard();
                         resolve({ accountId, xatoken, balance: wfBalance });
                     }
                 }
@@ -177,6 +180,11 @@ function pollForWFData(tabId, wfAccountId, onTick) {
                 // Tab not ready yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 
@@ -202,6 +210,7 @@ function pollForWFAccounts(tabId) {
             const elapsed = Date.now() - start;
             if (elapsed > POLL_TIMEOUT_MS) {
                 clearInterval(interval);
+                removeGuard();
                 reject(new Error("Timed out waiting for Wells Fargo accounts"));
                 return;
             }
@@ -230,12 +239,18 @@ function pollForWFAccounts(tabId) {
                 const accounts = result?.[0]?.result;
                 if (accounts?.length > 0) {
                     clearInterval(interval);
+                    removeGuard();
                     resolve(accounts);
                 }
             } catch {
                 // Tab not ready yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

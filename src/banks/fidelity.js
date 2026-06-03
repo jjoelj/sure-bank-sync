@@ -1,9 +1,10 @@
-import { getSyncPlan, pacificDate, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncFidelity(settings, accountMappings, accountKey, options = {}) {
     console.log("Fidelity: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
-    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
+    await seedLastTxDates(lastTxDates, accountMappings, [accountKey]);
+    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey, lastTxDates);
     if (!plan) {
         console.warn("Fidelity: no sync start date configured, skipping.");
         return;
@@ -153,6 +154,7 @@ function pollForFidelityData(tabId, onTick) {
                 if (!dataPageStart) dataPageStart = Date.now();
                 if (Date.now() - dataPageStart > POLL_TIMEOUT_MS) {
                     clearInterval(interval);
+                    removeGuard();
                     reject(new Error("Timed out waiting for Fidelity data"));
                     return;
                 }
@@ -209,6 +211,7 @@ function pollForFidelityData(tabId, onTick) {
                     const result = await chrome.tabs.sendMessage(tabId, { type: "GET_FIDELITY_DATA" });
                     if (result?.accessToken && result?.accountToken) {
                         clearInterval(interval);
+                        removeGuard();
                         resolve(result);
                     }
                 }
@@ -218,6 +221,11 @@ function pollForFidelityData(tabId, onTick) {
                 busy = false;
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

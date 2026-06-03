@@ -14,11 +14,12 @@ const KNOWN_LOCAL_KEYS = new Set([
   "cachedSureAccounts", "cachedSofiAccounts", "cachedCapitalOneAccounts", "cachedUSBankAccounts", "cachedWFAccounts",
   "lastSyncTime", "lastCompletedSyncSessionId", "lastCompletedSyncSummary",
   "activeSyncSessionId", "activeSyncSummary", "syncFromDate",
-  "lastSyncDates", "lastSyncMetrics", "syncErrors",
+  "lastSyncDates", "lastSyncMetrics", "syncErrors", "lastTxDates",
+  "logBuffer",
 ]);
 
 const PER_ACCOUNT_KEYS = [
-  "lastSyncDates", "lastSyncMetrics", "syncErrors",
+  "lastSyncDates", "lastSyncMetrics", "syncErrors", "lastTxDates",
 ];
 
 function isValidKey(key) {
@@ -104,10 +105,11 @@ async function init() {
 // ── View management ───────────────────────────────────────────────────────────
 
 function showView(view) {
-  const isSettings = view === "settings";
-  $("accounts-view").style.display = isSettings ? "none" : "flex";
-  $("settings-view").style.display = isSettings ? "block" : "none";
-  $("settings-btn").classList.toggle("active", isSettings);
+  $("accounts-view").style.display = view === "accounts" ? "flex" : "none";
+  $("settings-view").style.display = view === "settings" ? "block" : "none";
+  $("logs-view").style.display = view === "logs" ? "block" : "none";
+  $("settings-btn").classList.toggle("active", view === "settings");
+  $("logs-btn").classList.toggle("active", view === "logs");
 }
 
 $("refresh-btn").addEventListener("click", async () => {
@@ -118,9 +120,69 @@ $("refresh-btn").addEventListener("click", async () => {
 });
 
 $("settings-btn").addEventListener("click", () => {
-  const inAccounts = $("accounts-view").style.display !== "none";
-  showView(inAccounts ? "settings" : "accounts");
+  const inSettings = $("settings-view").style.display !== "none";
+  showView(inSettings ? "accounts" : "settings");
 });
+
+// ── Logs ────────────────────────────────────────────────────────────────────
+
+const LOG_BUFFER_KEY = "logBuffer";
+const MAX_LOG_LINES = 600;
+const renderedLogIds = new Set();
+
+$("logs-btn").addEventListener("click", () => {
+  const inLogs = $("logs-view").style.display !== "none";
+  showView(inLogs ? "accounts" : "logs");
+  if (!inLogs) renderAllLogs();
+});
+
+$("logs-clear-btn").addEventListener("click", async () => {
+  await sendMessage({ type: "CLEAR_LOGS" });
+  renderedLogIds.clear();
+  $("logs-output").innerHTML = '<div class="logs-empty">No logs yet.</div>';
+});
+
+function formatLogTime(t) {
+  return new Date(t).toLocaleTimeString("en-US", { hour12: false });
+}
+
+function appendLogLine(entry) {
+  if (renderedLogIds.has(entry.id)) return;
+  renderedLogIds.add(entry.id);
+
+  const out = $("logs-output");
+  out.querySelector(".logs-empty")?.remove();
+
+  const line = document.createElement("div");
+  line.className = `log-line ${entry.level}`;
+
+  const time = document.createElement("span");
+  time.className = "log-time";
+  time.textContent = formatLogTime(entry.t);
+
+  const msg = document.createElement("span");
+  msg.className = "log-msg";
+  msg.textContent = entry.msg;
+
+  line.appendChild(time);
+  line.appendChild(msg);
+  out.appendChild(line);
+
+  while (out.children.length > MAX_LOG_LINES) out.removeChild(out.firstChild);
+  if ($("logs-autoscroll").checked) out.scrollTop = out.scrollHeight;
+}
+
+async function renderAllLogs() {
+  const { [LOG_BUFFER_KEY]: entries = [] } = await chrome.storage.local.get(LOG_BUFFER_KEY);
+  const out = $("logs-output");
+  out.innerHTML = "";
+  renderedLogIds.clear();
+  if (!entries.length) {
+    out.innerHTML = '<div class="logs-empty">No logs yet.</div>';
+    return;
+  }
+  for (const entry of entries) appendLogLine(entry);
+}
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -889,7 +951,9 @@ function updateSyncFromControl(anyUnsynced) {
 }
 
 function formatDate(isoStr) {
-  if (isoStr === offsetDate(pacificDate(new Date()), -1)) return "today";
+  const today = pacificDate(new Date());
+  if (isoStr === today) return "today";
+  if (isoStr === offsetDate(today, -1)) return "yesterday";
   const [year, month, day] = isoStr.split("-");
   return new Date(year, month - 1, day).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
@@ -962,6 +1026,34 @@ function applyProgressState(row, key, progress) {
   }
 }
 
+const SYNC_COOLDOWN_MS = 2 * 60 * 1000;
+let cooldownTimer = null;
+
+function startSyncCooldown() {
+  const syncBtn = $("sync-btn");
+  const endTime = Date.now() + SYNC_COOLDOWN_MS;
+  clearInterval(cooldownTimer);
+
+  function tick() {
+    const remaining = Math.max(0, endTime - Date.now());
+    if (remaining <= 0) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = null;
+      syncBtn.disabled = false;
+      syncBtn.textContent = "Sync Now";
+      return;
+    }
+    const secs = Math.ceil(remaining / 1000);
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    syncBtn.textContent = `Sync Now (${m}:${String(s).padStart(2, "0")})`;
+  }
+
+  syncBtn.disabled = true;
+  tick();
+  cooldownTimer = setInterval(tick, 1000);
+}
+
 async function runSyncFromPopup(options, pendingMessage) {
   const syncBtn = $("sync-btn");
   syncBtn.disabled = true;
@@ -975,12 +1067,21 @@ async function runSyncFromPopup(options, pendingMessage) {
     if (lastSyncTime) showStatus(`Last synced ${formatDateTime(lastSyncTime)}`, "");
   }
 
-  syncBtn.disabled = false;
+  if (!options.targetKeys) {
+    startSyncCooldown();
+  } else {
+    syncBtn.disabled = false;
+  }
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === "LOG_ENTRY") {
+    appendLogLine(msg.entry);
+    return;
+  }
+
   if (msg.type === "SYNC_UPDATED") {
     renderSyncStatus();
     renderSyncSummary();

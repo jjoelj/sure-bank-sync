@@ -1,13 +1,14 @@
-import { getSyncPlan, parseCsvLine, openTabBackground, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, parseCsvLine, openTabBackground, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncVenmo(settings, accountMappings, options = {}) {
     console.log("Venmo: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
+    await seedLastTxDates(lastTxDates, accountMappings, ["venmo-cash", "venmo-credit"]);
 
     const cashAccountId = accountMappings["venmo-cash"];
     const creditAccountId = accountMappings["venmo-credit"];
-    const cashPlan = cashAccountId ? getSyncPlan(lastSyncDates, syncFromDate, "venmo-cash") : null;
-    const creditPlan = creditAccountId ? getSyncPlan(lastSyncDates, syncFromDate, "venmo-credit") : null;
+    const cashPlan = cashAccountId ? getSyncPlan(lastSyncDates, syncFromDate, "venmo-cash", lastTxDates) : null;
+    const creditPlan = creditAccountId ? getSyncPlan(lastSyncDates, syncFromDate, "venmo-credit", lastTxDates) : null;
     const needsCash = cashAccountId && cashPlan;
     const needsCredit = creditAccountId && creditPlan;
 
@@ -169,6 +170,7 @@ function pollForVenmoData(tabId, { needsProfileId, needsBearerToken }, onTick) {
                 if (Date.now() - dataPageStart > POLL_TIMEOUT_MS) {
                     clearInterval(interval);
                     cleanup();
+                    removeGuard();
                     reject(new Error("Timed out waiting for Venmo data"));
                     return;
                 }
@@ -213,12 +215,19 @@ function pollForVenmoData(tabId, { needsProfileId, needsBearerToken }, onTick) {
                 if (gotAll) {
                     clearInterval(interval);
                     cleanup();
+                    removeGuard();
                     resolve({ profileId, bearerToken });
                 }
             } catch {
                 // Tab not ready yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            cleanup();
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

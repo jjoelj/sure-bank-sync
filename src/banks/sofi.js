@@ -1,12 +1,13 @@
-import { getDateChunks, getSyncPlan, pacificDate, parseCsvLine, openTabBackground, POLL_TIMEOUT_MS, POLL_INTERVAL_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift } from "../utils.js";
+import { getDateChunks, getSyncPlan, seedLastTxDates, pacificDate, parseCsvLine, openTabBackground, POLL_TIMEOUT_MS, POLL_INTERVAL_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncSoFi(settings, accountMappings, options = {}) {
     console.log("SoFi: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
 
     const allSofiKeys = Object.keys(accountMappings).filter(k => k.startsWith("sofi-"));
     const syncKeys = options.syncKeys?.length ? options.syncKeys : allSofiKeys;
-    const plans = Object.fromEntries(syncKeys.map(k => [k, getSyncPlan(lastSyncDates, syncFromDate, k)]));
+    await seedLastTxDates(lastTxDates, accountMappings, syncKeys);
+    const plans = Object.fromEntries(syncKeys.map(k => [k, getSyncPlan(lastSyncDates, syncFromDate, k, lastTxDates)]));
     const activeKeys = syncKeys.filter(k => plans[k]);
     const tab = await openTabBackground("https://www.sofi.com/my/banking/accounts/");
     activeKeys.forEach(k => reportProgress(options, k, 15, "Opening SoFi…"));
@@ -115,7 +116,7 @@ export async function syncSoFi(settings, accountMappings, options = {}) {
     const creditKey = "sofi-credit";
     const creditActualId = accountMappings[creditKey];
     scope: if (creditActualId && syncKeys.includes(creditKey)) {
-        const creditPlan = getSyncPlan(lastSyncDates, syncFromDate, creditKey);
+        const creditPlan = getSyncPlan(lastSyncDates, syncFromDate, creditKey, lastTxDates);
         if (!creditPlan) {
             console.warn(`SoFi Credit: no sync start date configured, skipping.`);
             break scope
@@ -234,6 +235,7 @@ function pollForApolloState(tabId, onTick) {
             const elapsed = Date.now() - start;
             if (elapsed > POLL_TIMEOUT_MS) {
                 clearInterval(interval);
+                removeGuard();
                 reject(new Error("Timed out waiting for Apollo state"));
                 return;
             }
@@ -273,12 +275,18 @@ function pollForApolloState(tabId, onTick) {
                     k.startsWith("CheckingAccount") || k.startsWith("SavingsAccount")
                 )) {
                     clearInterval(interval);
+                    removeGuard();
                     resolve(apolloState);
                 }
             } catch {
                 // Tab not ready yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

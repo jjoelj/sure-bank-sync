@@ -1,9 +1,10 @@
-import { getSyncPlan, pacificDate, openTabBackground, parseCsvLine, POLL_TIMEOUT_MS, POLL_INTERVAL_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, getDateChunks, logBalanceDrift } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, parseCsvLine, POLL_TIMEOUT_MS, POLL_INTERVAL_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, getDateChunks, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncBilt(settings, accountMappings, accountKey, options = {}) {
     console.log("Bilt: starting");
-    const { lastSyncDates = {}, syncFromDate } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate"]);
-    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey);
+    const { lastSyncDates = {}, syncFromDate, lastTxDates = {} } = await chrome.storage.local.get(["lastSyncDates", "syncFromDate", "lastTxDates"]);
+    await seedLastTxDates(lastTxDates, accountMappings, [accountKey]);
+    const plan = getSyncPlan(lastSyncDates, syncFromDate, accountKey, lastTxDates);
     if (!plan) {
         console.warn("Bilt: no sync start date configured, skipping.");
         return;
@@ -91,6 +92,7 @@ function pollForBiltData(tabId, onTick) {
             const elapsed = Date.now() - start;
             if (elapsed > POLL_TIMEOUT_MS) {
                 clearInterval(interval);
+                removeGuard();
                 reject(new Error("Timed out waiting for Bilt data"));
                 return;
             }
@@ -100,12 +102,18 @@ function pollForBiltData(tabId, onTick) {
                 const response = await chrome.tabs.sendMessage(tabId, { type: "GET_BILT_DATA" });
                 if (response?.accessToken && response?.cardId) {
                     clearInterval(interval);
+                    removeGuard();
                     resolve(response);
                 }
             } catch {
                 // Tab not ready yet
             }
         }, POLL_INTERVAL_MS);
+
+        const removeGuard = onTabClose(tabId, () => {
+            clearInterval(interval);
+            reject(new Error("Browser window closed"));
+        });
     });
 }
 

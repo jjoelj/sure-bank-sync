@@ -6,7 +6,7 @@ export function subtractOneDay(isoDate) {
     return new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
 }
 
-import { createCsvImport, getTransactions } from './sure.js';
+import { createCsvImport, getTransactions, getLatestTransactionDate } from './sure.js';
 
 export function logBalanceDrift(label, sureBalance, addedSum, bankBalance) {
     const expected = sureBalance + addedSum;
@@ -114,9 +114,28 @@ export function offsetDate(isoStr, days) {
     return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
 }
 
-export function getSyncPlan(lastSyncDates, syncFromDate, key) {
+export async function seedLastTxDates(lastTxDates, accountMappings, keys) {
+    let updated = false;
+    for (const key of keys) {
+        if (lastTxDates[key]) continue;
+        const sureAccountId = accountMappings[key];
+        if (!sureAccountId) continue;
+        try {
+            const date = await getLatestTransactionDate(sureAccountId);
+            if (date) {
+                lastTxDates[key] = date;
+                updated = true;
+            }
+        } catch (err) {
+            console.warn(`Failed to seed lastTxDate for ${key}:`, err.message);
+        }
+    }
+    if (updated) await chrome.storage.local.set({ lastTxDates });
+}
+
+export function getSyncPlan(lastSyncDates, syncFromDate, key, lastTxDates = {}) {
     const endDate = pacificDate(new Date());
-    const startDate = lastSyncDates[key] || syncFromDate;
+    const startDate = lastTxDates[key] || lastSyncDates[key] || syncFromDate;
     if (!startDate) return null;
 
     return { startDate, endDate };
@@ -142,6 +161,17 @@ export function openTabBackground(url) {
     });
 }
 
+export function onTabClose(tabId, onClose) {
+    function listener(removedTabId) {
+        if (removedTabId === tabId) {
+            chrome.tabs.onRemoved.removeListener(listener);
+            onClose();
+        }
+    }
+    chrome.tabs.onRemoved.addListener(listener);
+    return () => chrome.tabs.onRemoved.removeListener(listener);
+}
+
 
 export async function updateLastSyncDate(key, date) {
     const { lastSyncDates = {} } = await chrome.storage.local.get("lastSyncDates");
@@ -150,10 +180,11 @@ export async function updateLastSyncDate(key, date) {
 }
 
 export async function updateLastSyncMetrics(key, transactions) {
-    const { lastSyncMetrics = {}, activeSyncSessionId = null, activeSyncSummary = null } = await chrome.storage.local.get([
+    const { lastSyncMetrics = {}, activeSyncSessionId = null, activeSyncSummary = null, lastTxDates = {} } = await chrome.storage.local.get([
         "lastSyncMetrics",
         "activeSyncSessionId",
         "activeSyncSummary",
+        "lastTxDates",
     ]);
 
     const metrics = {
@@ -179,6 +210,13 @@ export async function updateLastSyncMetrics(key, transactions) {
     if (transactions.length > 0) {
         lastSyncMetrics[key] = metrics;
         updates.lastSyncMetrics = lastSyncMetrics;
+
+        let maxDate = transactions[0].date;
+        for (const tx of transactions) {
+            if (tx.date > maxDate) maxDate = tx.date;
+        }
+        lastTxDates[key] = maxDate;
+        updates.lastTxDates = lastTxDates;
     } else if (!lastSyncMetrics[key]) {
         lastSyncMetrics[key] = metrics;
         updates.lastSyncMetrics = lastSyncMetrics;

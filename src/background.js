@@ -1,3 +1,6 @@
+import { installLogCapture, clearLogBuffer } from "./logger.js";
+installLogCapture();
+
 import { syncSoFi, getSoFiAccountsForPopup } from "./banks/sofi.js";
 import { syncVenmo } from "./banks/venmo.js";
 import { syncBilt } from "./banks/bilt.js";
@@ -8,6 +11,7 @@ import { syncUSBank, getUSBankAccountsForPopup } from "./banks/usbank.js";
 import { syncWellsFargo, getWellsFargoAccountsForPopup } from "./banks/wellsfargo.js";
 import { testConnection, getAccounts, deleteAllTransactions, applyRules, getTransactionCount } from "./sure.js";
 import { ACCOUNT_TYPES } from "./accounts.js";
+import { pacificDate } from "./utils.js";
 
 const SINGLE_ACCOUNT_SYNC = {
   bilt:     syncBilt,
@@ -66,11 +70,22 @@ async function runSync(options = {}) {
     console.warn("Failed to fetch Sure balances:", err.message);
   }
 
-  const scopedMappings = options.targetKeys?.length
-    ? Object.fromEntries(Object.entries(accountMappings).filter(([key]) => options.targetKeys.includes(key)))
-    : accountMappings;
+  const { lastSyncDates = {} } = await chrome.storage.local.get("lastSyncDates");
+  const today = pacificDate(new Date());
+
+  let scopedMappings;
+  if (options.targetKeys?.length) {
+    scopedMappings = Object.fromEntries(Object.entries(accountMappings).filter(([key]) => options.targetKeys.includes(key)));
+  } else {
+    scopedMappings = Object.fromEntries(Object.entries(accountMappings).filter(([key]) => lastSyncDates[key] !== today));
+  }
 
   const keys = Object.keys(scopedMappings);
+
+  if (keys.length === 0) {
+    console.log("All accounts already synced today.");
+    return;
+  }
 
   const sofiKeys = keys.filter(k => k.startsWith("sofi-"));
   if (sofiKeys.length) {
@@ -128,9 +143,9 @@ async function runSync(options = {}) {
     }
   }
 
-  const { lastSyncMetrics = {}, lastSyncDates = {} } = await chrome.storage.local.get(["lastSyncMetrics", "lastSyncDates"]);
+  const { lastSyncMetrics = {}, lastSyncDates: currentSyncDates = {} } = await chrome.storage.local.get(["lastSyncMetrics", "lastSyncDates"]);
   const mappedKeys = Object.keys(accountMappings);
-  const syncedAccounts = mappedKeys.filter(k => lastSyncDates[k]).length;
+  const syncedAccounts = mappedKeys.filter(k => currentSyncDates[k]).length;
   const metricValues = mappedKeys.map(k => lastSyncMetrics[k]).filter(Boolean);
   const newSummary = syncedAccounts > 0
     ? metricValues.reduce((acc, m) => ({
@@ -228,6 +243,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "GET_WF_ACCOUNTS") {
     getWellsFargoAccountsForPopup()
       .then((accounts) => sendResponse({ accounts }))
+      .catch((err) => sendResponse({ error: err.message }));
+    return true;
+  }
+
+  if (msg.type === "CLEAR_LOGS") {
+    clearLogBuffer()
+      .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ error: err.message }));
     return true;
   }

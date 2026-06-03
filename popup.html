@@ -14,6 +14,7 @@
   </div>
   <div class="header-right">
     <button id="refresh-btn" title="Refresh Sure accounts">↻</button>
+    <button id="logs-btn" title="View logs">▤</button>
     <button id="settings-btn" title="Settings">⚙</button>
     <button id="sync-btn" style="display:none">Sync Now</button>
   </div>
@@ -51,6 +52,16 @@
     <button id="add-account-btn">+ Add account</button>
     <div id="account-type-dropdown"></div>
   </div>
+</div>
+
+<!-- Logs view -->
+<div id="logs-view" style="display:none">
+  <div class="logs-toolbar">
+    <span class="logs-title">Service worker logs</span>
+    <label class="logs-autoscroll"><input type="checkbox" id="logs-autoscroll" checked /> Auto-scroll</label>
+    <button id="logs-clear-btn" class="btn">Clear</button>
+  </div>
+  <div id="logs-output"></div>
 </div>
 
 <!-- Settings view -->
