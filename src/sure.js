@@ -76,19 +76,29 @@ export async function createCsvImport(accountId, transactions) {
     }),
   });
 
-  const importId = result.id || result.import?.id;
+  const importId = result.data?.id || result.id || result.import?.id;
   if (importId) await waitForImportComplete(importId);
+  else console.warn("CSV import: response had no import id, cannot confirm completion.", JSON.stringify(result));
 
   return result;
 }
 
 async function waitForImportComplete(importId, timeoutMs = 120000) {
   const start = Date.now();
+  let seen = false; // have we observed the import in the listing yet?
   while (Date.now() - start < timeoutMs) {
     const data = await apiFetch(`/imports?per_page=100`);
-    const imp = data.imports?.find(i => i.id === importId);
-    if (!imp || imp.status === "complete") return;
-    if (imp.status === "failed") throw new Error(`Import ${importId} failed`);
+    const list = data.imports || data.data || [];
+    const imp = list.find(i => i.id === importId);
+    if (imp) {
+      seen = true;
+      if (imp.status === "complete") return;
+      if (imp.status === "failed") throw new Error(`Import ${importId} failed`);
+    } else if (seen) {
+      // It was listed and is now gone — treat as complete (the list drops it).
+      return;
+    }
+    // Not yet listed (indexing lag): keep waiting rather than assuming complete.
     await new Promise(r => setTimeout(r, 1000));
   }
   console.warn(`Import ${importId}: timed out waiting for completion`);
@@ -131,19 +141,32 @@ export async function getTransactionCount(accountId) {
 }
 
 export async function deleteAllTransactions(accountId) {
-  const transactions = await getTransactions(accountId);
   const { apiKey, baseUrl } = await getSettings();
-  for (const tx of transactions) {
-    const res = await fetch(`${baseUrl}/transactions/${tx.id}`, {
-      method: "DELETE",
-      headers: { "X-Api-Key": apiKey },
-    });
-    if (!res.ok) {
+  let deleted = 0;
+  const MAX_PASSES = 100; // safety bound; each pass strictly reduces what remains
+
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const transactions = await getTransactions(accountId);
+    if (transactions.length === 0) return deleted;
+
+    for (const tx of transactions) {
+      const res = await fetch(`${baseUrl}/transactions/${tx.id}`, {
+        method: "DELETE",
+        headers: { "X-Api-Key": apiKey },
+      });
+      if (res.ok) { deleted++; continue; }
+
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.message || body.error || `Delete failed: ${res.status}`);
+      const msg = body.message || body.error || `Delete failed: ${res.status}`;
+      // A row from our snapshot can already be gone — e.g. Sure auto-removes a
+      // transfer's paired entry when its counterpart is deleted. Skip it and let
+      // the next pass re-fetch a fresh list, restarting the delete rather than
+      // aborting the whole operation. Any other error is real and propagates.
+      if (res.status === 404 || /not found/i.test(msg)) continue;
+      throw new Error(msg);
     }
   }
-  return transactions.length;
+  throw new Error(`Delete did not finish after ${MAX_PASSES} passes — transactions keep reporting "not found".`);
 }
 
 
@@ -162,12 +185,20 @@ export async function getTransactions(accountId, { startDate, endDate } = {}) {
   return all;
 }
 
+// A transaction is part of a transfer when Sure links it via `transfer`, or
+// classifies it as one. Transfers (e.g. card payments) can be dated later than
+// the last real bank transaction, so they must be excluded from the sync
+// watermark or the next sync skips the gap between them.
+function isTransfer(tx) {
+  return Boolean(tx.transfer) || tx.classification === "transfer";
+}
+
 export async function getLatestTransactionDate(accountId) {
   const txs = await getTransactions(accountId);
-  if (txs.length === 0) return null;
-  let maxDate = txs[0].date;
+  let maxDate = null;
   for (const tx of txs) {
-    if (tx.date > maxDate) maxDate = tx.date;
+    if (isTransfer(tx)) continue;
+    if (maxDate == null || tx.date > maxDate) maxDate = tx.date;
   }
   return maxDate;
 }
