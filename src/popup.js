@@ -1,5 +1,5 @@
 import { ACCOUNT_TYPES, BANK_LABELS, getBankForKey } from "./accounts.js";
-import { pacificDate, offsetDate } from "./utils.js";
+import { pacificDate, offsetDate, getSyncPlan } from "./utils.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -153,6 +153,54 @@ $("settings-btn").addEventListener("click", () => {
 const LOG_BUFFER_KEY = "logBuffer";
 const MAX_LOG_LINES = 600;
 const renderedLogIds = new Set();
+let logFilter = ""; // lowercased; empty = show all
+
+function lineMatchesFilter(searchText) {
+  return !logFilter || searchText.includes(logFilter);
+}
+
+// Render `text` into `el`, wrapping case-insensitive matches of `filter` in
+// <mark>. Built from text nodes so log content can't inject markup.
+function highlightInto(el, text, filter) {
+  el.textContent = "";
+  if (!filter) { el.textContent = text; return; }
+  const lower = text.toLowerCase();
+  let i = 0, idx;
+  while ((idx = lower.indexOf(filter, i)) !== -1) {
+    if (idx > i) el.appendChild(document.createTextNode(text.slice(i, idx)));
+    const mark = document.createElement("mark");
+    mark.textContent = text.slice(idx, idx + filter.length);
+    el.appendChild(mark);
+    i = idx + filter.length;
+  }
+  if (i < text.length) el.appendChild(document.createTextNode(text.slice(i)));
+}
+
+function updateLogSearchCount() {
+  const el = $("logs-search-count");
+  if (!logFilter) { el.textContent = ""; return; }
+  let visible = 0;
+  for (const line of $("logs-output").querySelectorAll(".log-line")) {
+    if (lineMatchesFilter(line.dataset.search)) visible++;
+  }
+  el.textContent = `${visible} match${visible === 1 ? "" : "es"}`;
+}
+
+// Re-apply the current filter to every rendered line (show/hide + re-highlight).
+function applyLogFilter() {
+  for (const line of $("logs-output").querySelectorAll(".log-line")) {
+    const match = lineMatchesFilter(line.dataset.search);
+    line.style.display = match ? "" : "none";
+    const msg = line.querySelector(".log-msg");
+    if (msg) highlightInto(msg, line.dataset.msg, logFilter);
+  }
+  updateLogSearchCount();
+}
+
+$("logs-search").addEventListener("input", (e) => {
+  logFilter = e.target.value.trim().toLowerCase();
+  applyLogFilter();
+});
 
 $("logs-btn").addEventListener("click", () => {
   const inLogs = $("logs-view").style.display !== "none";
@@ -164,6 +212,7 @@ $("logs-clear-btn").addEventListener("click", async () => {
   await sendMessage({ type: "CLEAR_LOGS" });
   renderedLogIds.clear();
   $("logs-output").innerHTML = '<div class="logs-empty">No logs yet.</div>';
+  updateLogSearchCount();
 });
 
 function formatLogTime(t) {
@@ -179,6 +228,8 @@ function appendLogLine(entry) {
 
   const line = document.createElement("div");
   line.className = `log-line ${entry.level}`;
+  line.dataset.msg = entry.msg;
+  line.dataset.search = `${entry.msg} ${entry.level}`.toLowerCase();
 
   const time = document.createElement("span");
   time.className = "log-time";
@@ -186,14 +237,17 @@ function appendLogLine(entry) {
 
   const msg = document.createElement("span");
   msg.className = "log-msg";
-  msg.textContent = entry.msg;
+  highlightInto(msg, entry.msg, logFilter);
 
   line.appendChild(time);
   line.appendChild(msg);
+  const matches = lineMatchesFilter(line.dataset.search);
+  if (!matches) line.style.display = "none";
   out.appendChild(line);
 
   while (out.children.length > MAX_LOG_LINES) out.removeChild(out.firstChild);
-  if ($("logs-autoscroll").checked) out.scrollTop = out.scrollHeight;
+  if (logFilter) updateLogSearchCount();
+  if (matches && $("logs-autoscroll").checked) out.scrollTop = out.scrollHeight;
 }
 
 async function renderAllLogs() {
@@ -203,9 +257,11 @@ async function renderAllLogs() {
   renderedLogIds.clear();
   if (!entries.length) {
     out.innerHTML = '<div class="logs-empty">No logs yet.</div>';
+    updateLogSearchCount();
     return;
   }
   for (const entry of entries) appendLogLine(entry);
+  updateLogSearchCount();
 }
 
 // ── Categories ────────────────────────────────────────────────────────────────
@@ -519,39 +575,58 @@ $("connect-btn").addEventListener("click", async () => {
   }
 });
 
-$("delete-all-btn").addEventListener("click", async () => {
+$("reset-btn").addEventListener("click", async () => {
   if (!sureAccounts.length) {
     showStatus("No accounts loaded.", "error");
     return;
   }
-  $("delete-all-btn").disabled = true;
+  $("reset-btn").disabled = true;
   let total = 0;
-  const { lastSyncDates = {}, lastSyncMetrics = {} } = await chrome.storage.local.get(["lastSyncDates", "lastSyncMetrics"]);
   try {
+    // One pass to tally what would be deleted, then a single confirm for the
+    // whole operation — no per-account prompting.
+    showStatus("Counting transactions…", "");
+    const toDelete = [];
+    let grandTotal = 0;
     for (const account of sureAccounts) {
-      showStatus(`Checking ${account.name}...`, "");
       const countRes = await sendMessage({ type: "GET_TRANSACTION_COUNT", accountId: account.id });
       if (countRes.error) throw new Error(countRes.error);
       if (countRes.count === 0) continue;
-      if (!confirm(`Delete ${countRes.count} transaction${countRes.count === 1 ? "" : "s"} in "${account.name}"?`)) continue;
-      showStatus(`Deleting ${countRes.count} transactions from ${account.name}...`, "");
+      toDelete.push({ account, count: countRes.count });
+      grandTotal += countRes.count;
+    }
+    const txPart = grandTotal > 0
+      ? `Delete ${grandTotal} transaction${grandTotal === 1 ? "" : "s"} across ${toDelete.length} account${toDelete.length === 1 ? "" : "s"}, then reset`
+      : "No transactions to delete. Reset";
+    if (!confirm(`${txPart} sync data (category mappings, dates, queues)? Your account mappings are kept.`)) {
+      showStatus("Reset cancelled.", "");
+      return;
+    }
+    for (const { account, count } of toDelete) {
+      showStatus(`Deleting ${count} transactions from ${account.name}...`, "");
       const res = await sendMessage({ type: "DELETE_ALL_TRANSACTIONS", accountId: account.id });
       if (res.error) throw new Error(res.error);
       total += res.count;
-      for (const [key, sureId] of Object.entries(await chrome.storage.local.get("accountMappings").then(r => r.accountMappings || {}))) {
-        if (sureId === account.id) {
-          delete lastSyncDates[key];
-          delete lastSyncMetrics[key];
-        }
-      }
     }
-    await chrome.storage.local.set({ lastSyncDates, lastSyncMetrics });
-    showStatus(`Deleted ${total} transaction${total === 1 ? "" : "s"}.`, "ok");
+    // Reset is a full clean slate: wipe every sync watermark, metric, category
+    // mapping, held-back queue, and stored error so the next sync re-pulls from
+    // scratch and re-prompts/re-categorizes fresh. This runs even when there are
+    // no transactions to delete. Account configuration (accountMappings,
+    // syncFromDate) is left intact.
+    await chrome.storage.local.set({
+      lastSyncDates: {},
+      lastSyncMetrics: {},
+      lastTxDates: {},
+      syncErrors: {},
+      categoryMappings: {},
+      pendingCategoryTxns: {},
+    });
+    showStatus(total > 0 ? `Deleted ${total} transaction${total === 1 ? "" : "s"} and reset.` : "Reset complete.", "ok");
     await loadSureAccounts();
   } catch (err) {
-    showStatus(`Delete failed: ${err.message}`, "error");
+    showStatus(`Reset failed: ${err.message}`, "error");
   } finally {
-    $("delete-all-btn").disabled = false;
+    $("reset-btn").disabled = false;
   }
 });
 
@@ -590,8 +665,8 @@ $("sync-btn").addEventListener("click", async () => {
   await runSyncFromPopup({}, "Syncing…");
 });
 
-$("sync-from-date").addEventListener("change", () => {
-  chrome.storage.local.set({ syncFromDate: $("sync-from-date").value });
+$("sync-from-date").addEventListener("change", async () => {
+  await chrome.storage.local.set({ syncFromDate: $("sync-from-date").value });
   updateSyncBtn();
 });
 
@@ -873,6 +948,11 @@ function addMappingRow(mappingKey, label, selectedId) {
   subEl.className = "account-sub";
   subEl.id = `sub-${mappingKey}`;
 
+  const rangeEl = document.createElement("div");
+  rangeEl.className = "account-range";
+  rangeEl.id = `range-${mappingKey}`;
+  rangeEl.title = "Date range the next sync will cover";
+
   const progressEl = document.createElement("div");
   progressEl.className = "account-progress";
 
@@ -885,6 +965,7 @@ function addMappingRow(mappingKey, label, selectedId) {
   info.appendChild(labelEl);
   info.appendChild(sourceEl);
   info.appendChild(subEl);
+  info.appendChild(rangeEl);
   info.appendChild(progressEl);
 
   const select = document.createElement("select");
@@ -1130,8 +1211,8 @@ async function saveMappings() {
 // ── Sync status ───────────────────────────────────────────────────────────────
 
 async function renderSyncStatus() {
-  const { lastSyncDates = {}, lastSyncMetrics = {}, syncErrors = {}, accountMappings = {} } =
-    await chrome.storage.local.get(["lastSyncDates", "lastSyncMetrics", "syncErrors", "accountMappings"]);
+  const { lastSyncDates = {}, lastSyncMetrics = {}, syncErrors = {}, accountMappings = {}, lastTxDates = {}, syncFromDate } =
+    await chrome.storage.local.get(["lastSyncDates", "lastSyncMetrics", "syncErrors", "accountMappings", "lastTxDates", "syncFromDate"]);
 
   const balanceMap = Object.fromEntries(sureAccounts.map(a => [a.id, a.balance_cents]));
 
@@ -1146,6 +1227,12 @@ async function renderSyncStatus() {
     const sureId = accountMappings[key];
     const bal = sureId != null ? balanceMap[sureId] : undefined;
     const balHtml = bal != null ? balanceSpan(bal) : "";
+
+    const rangeEl = document.getElementById(`range-${key}`);
+    if (rangeEl) {
+      const plan = sureId != null ? getSyncPlan(lastSyncDates, syncFromDate, key, lastTxDates) : null;
+      rangeEl.textContent = plan ? `${formatRangeDate(plan.startDate)} → ${formatRangeDate(plan.endDate)}` : "";
+    }
 
     if (syncErrors[key]) {
       el.innerHTML = escapeHtml(syncErrors[key]) + (balHtml ? ` • ${balHtml}` : "");
@@ -1252,6 +1339,11 @@ function formatDate(isoStr) {
   if (isoStr === offsetDate(today, -1)) return "yesterday";
   const [year, month, day] = isoStr.split("-");
   return new Date(year, month - 1, day).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function formatRangeDate(isoStr) {
+  const [year, month, day] = isoStr.split("-");
+  return `${month}/${day}/${year}`;
 }
 
 function formatDateTime(value) {
