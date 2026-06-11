@@ -9,9 +9,9 @@ import { syncFidelity } from "./banks/fidelity.js";
 import { syncTarget } from "./banks/target.js";
 import { syncUSBank, getUSBankAccountsForPopup } from "./banks/usbank.js";
 import { syncWellsFargo, getWellsFargoAccountsForPopup } from "./banks/wellsfargo.js";
-import { testConnection, getAccounts, deleteAllTransactions, applyRules, getTransactionCount } from "./sure.js";
+import { testConnection, getAccounts, getCategories, createCategory, deleteAllTransactions, applyRules, getTransactionCount } from "./sure.js";
 import { ACCOUNT_TYPES } from "./accounts.js";
-import { pacificDate } from "./utils.js";
+import { pacificDate, flushPendingCategories } from "./utils.js";
 
 const SINGLE_ACCOUNT_SYNC = {
   bilt:     syncBilt,
@@ -23,9 +23,46 @@ function sendProgress(key, percent, message) {
   chrome.runtime.sendMessage({ type: "SYNC_PROGRESS", key, percent, message }).catch(() => {});
 }
 
+// Per-account progress reporter for flushes (upload phase only). A null message
+// clears the row's progress; otherwise the 0→1 fraction maps onto the full bar.
+function sendFlushProgress(key, frac, message) {
+  if (message == null) sendProgress(key, null);
+  else sendProgress(key, Math.round(frac * 100), message);
+}
+
 // ── Sync orchestration ───────────────────────────────────────────────────────
 
 let syncInProgress = false;
+let flushQueued = false;
+
+// Coalescing flush driver. Requests that arrive while a sync or an earlier flush
+// is running don't get dropped — they set flushQueued, and the in-flight run
+// loops to pick them up (or runSync drains on completion). This way mapping a
+// category while a previous flush is still running still imports.
+function requestFlush() {
+  flushQueued = true;
+  pumpFlush();
+}
+
+async function pumpFlush() {
+  if (syncInProgress) return;       // a sync or flush is running; it will drain on completion
+  if (!flushQueued) return;
+  syncInProgress = true;
+  try {
+    while (flushQueued) {
+      flushQueued = false;
+      try {
+        const { added } = await flushPendingCategories(undefined, sendFlushProgress);
+        if (added) console.log(`Flushed ${added} mapped transaction(s).`);
+      } catch (err) {
+        console.warn("Flush failed:", err.message);
+      }
+    }
+  } finally {
+    syncInProgress = false;
+  }
+  await notifyPopup();
+}
 
 async function runSync(options = {}) {
   if (syncInProgress) {
@@ -81,6 +118,15 @@ async function runSync(options = {}) {
   }
 
   const keys = Object.keys(scopedMappings);
+
+  // Safety net: import any held-back transactions whose category has since been
+  // mapped (the popup also flushes immediately when a mapping is saved).
+  try {
+    const { added } = await flushPendingCategories(keys, sendFlushProgress);
+    if (added) console.log(`Flushed ${added} previously held transaction(s).`);
+  } catch (err) {
+    console.warn("Failed to flush pending categories:", err.message);
+  }
 
   if (keys.length === 0) {
     console.log("All accounts already synced today.");
@@ -167,6 +213,8 @@ async function runSync(options = {}) {
   } finally {
     await chrome.storage.local.remove(["activeSyncSessionId", "activeSyncSummary"]);
     syncInProgress = false;
+    // Drain anything mapped while this sync was running (or queued meanwhile).
+    requestFlush();
   }
 }
 
@@ -196,6 +244,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .then(() => sendResponse({ ok: true }))
         .catch((err) => sendResponse({ error: err.message }));
     return true;
+  }
+
+  if (msg.type === "GET_SURE_CATEGORIES") {
+    getCategories()
+      .then((categories) => sendResponse({ categories }))
+      .catch((err) => sendResponse({ error: err.message }));
+    return true;
+  }
+
+  if (msg.type === "CREATE_SURE_CATEGORY") {
+    createCategory(msg.name)
+      .then((category) => sendResponse({ category }))
+      .catch((err) => sendResponse({ error: err.message }));
+    return true;
+  }
+
+  if (msg.type === "FLUSH_PENDING_CATEGORIES") {
+    requestFlush();
+    sendResponse({ ok: true });
+    return false;
   }
 
   if (msg.type === "GET_SOFI_ACCOUNTS") {

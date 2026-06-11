@@ -1,9 +1,24 @@
-import { ACCOUNT_TYPES, BANK_LABELS } from "./accounts.js";
+import { ACCOUNT_TYPES, BANK_LABELS, getBankForKey } from "./accounts.js";
 import { pacificDate, offsetDate } from "./utils.js";
 
 const $ = (id) => document.getElementById(id);
 
+// Serializes async read-modify-write sections so rapid, overlapping calls don't
+// interleave at their awaits and clobber each other's writes (last-writer-wins).
+function makeMutex() {
+  let chain = Promise.resolve();
+  return (fn) => {
+    const run = chain.then(fn, fn);
+    chain = run.then(() => {}, () => {});
+    return run;
+  };
+}
+// Guards the categoryMappings read-modify-write: mapping several categories in
+// quick succession must not drop any mapping.
+const withCategoryMappingLock = makeMutex();
+
 let sureAccounts = [];
+let sureCategories = [];
 let addedTypes = new Set();
 const activeProgress = new Map();
 
@@ -16,10 +31,11 @@ const KNOWN_LOCAL_KEYS = new Set([
   "activeSyncSessionId", "activeSyncSummary", "syncFromDate",
   "lastSyncDates", "lastSyncMetrics", "syncErrors", "lastTxDates",
   "logBuffer",
+  "cachedSureCategories", "categoryMappings", "pendingCategoryTxns",
 ]);
 
 const PER_ACCOUNT_KEYS = [
-  "lastSyncDates", "lastSyncMetrics", "syncErrors", "lastTxDates",
+  "lastSyncDates", "lastSyncMetrics", "syncErrors", "lastTxDates", "pendingCategoryTxns",
 ];
 
 function isValidKey(key) {
@@ -65,6 +81,10 @@ async function init() {
 
   if (cachedSureAccounts) sureAccounts = cachedSureAccounts;
 
+  const { cachedSureCategories } = await chrome.storage.local.get("cachedSureCategories");
+  if (cachedSureCategories) sureCategories = cachedSureCategories;
+  await updateCategoriesBadge();
+
   const { syncFromDate } = await chrome.storage.local.get(["syncFromDate", "lastSyncDates"]);
   if (syncFromDate) $("sync-from-date").value = syncFromDate;
 
@@ -99,6 +119,7 @@ async function init() {
 
   if (settings.sureApiKey && settings.sureUrl) {
     loadSureAccounts();
+    loadSureCategories();
   }
 }
 
@@ -108,14 +129,17 @@ function showView(view) {
   $("accounts-view").style.display = view === "accounts" ? "flex" : "none";
   $("settings-view").style.display = view === "settings" ? "block" : "none";
   $("logs-view").style.display = view === "logs" ? "block" : "none";
+  $("categories-view").style.display = view === "categories" ? "block" : "none";
   $("settings-btn").classList.toggle("active", view === "settings");
   $("logs-btn").classList.toggle("active", view === "logs");
+  $("categories-btn").classList.toggle("active", view === "categories");
 }
 
 $("refresh-btn").addEventListener("click", async () => {
   $("refresh-btn").disabled = true;
   showStatus("Refreshing Sure accounts...", "");
   await loadSureAccounts();
+  await loadSureCategories();
   $("refresh-btn").disabled = false;
 });
 
@@ -184,6 +208,277 @@ async function renderAllLogs() {
   for (const entry of entries) appendLogLine(entry);
 }
 
+// ── Categories ────────────────────────────────────────────────────────────────
+
+const CAT_BLANK = "__blank__";
+const CAT_CREATE = "__create__";
+
+// Banks whose "mapped" section is expanded, remembered across re-renders.
+const expandedMappedBanks = new Set();
+
+$("categories-btn").addEventListener("click", async () => {
+  const inCategories = $("categories-view").style.display !== "none";
+  showView(inCategories ? "accounts" : "categories");
+  if (!inCategories) {
+    if (!sureCategories.length) await loadSureCategories();
+    await renderCategoriesView();
+  }
+});
+
+$("categories-refresh-btn").addEventListener("click", async () => {
+  $("categories-refresh-btn").disabled = true;
+  await loadSureCategories();
+  await renderCategoriesView();
+  $("categories-refresh-btn").disabled = false;
+});
+
+async function loadSureCategories() {
+  try {
+    const res = await sendMessage({ type: "GET_SURE_CATEGORIES" });
+    if (res.error) throw new Error(res.error);
+    sureCategories = res.categories || [];
+    await chrome.storage.local.set({ cachedSureCategories: sureCategories });
+    await updateCategoriesBadge();
+  } catch (err) {
+    console.warn("Failed to load Sure categories:", err.message);
+  }
+}
+
+// Collect held-back categories from the pending queue, grouped by bank, split
+// into ones still needing a mapping and ones already mapped (awaiting flush or
+// editable). pendingCounts[bank][raw] = how many transactions are waiting.
+async function getCategoryData() {
+  const { pendingCategoryTxns = {}, categoryMappings = {} } =
+    await chrome.storage.local.get(["pendingCategoryTxns", "categoryMappings"]);
+
+  const rawByBank = {};
+  const pendingCounts = {};
+  const txnsByBankRaw = {}; // bank -> raw category -> [{ date, name }]
+  for (const [key, txns] of Object.entries(pendingCategoryTxns)) {
+    const bank = getBankForKey(key);
+    if (!bank) continue;
+    for (const tx of txns) {
+      if (!tx.category) continue;
+      const raw = tx.category;
+      (rawByBank[bank] ??= new Set()).add(raw);
+      ((pendingCounts[bank] ??= {})[raw] ??= 0);
+      pendingCounts[bank][raw]++;
+      (((txnsByBankRaw[bank] ??= {})[raw] ??= [])).push({ date: tx.date, name: tx.payee_name });
+    }
+  }
+
+  // All distinct transaction names per category (most-recent first), so the
+  // full set of merchants under an unfamiliar category is visible when mapping.
+  const examples = {};
+  for (const [bank, byRaw] of Object.entries(txnsByBankRaw)) {
+    examples[bank] = {};
+    for (const [raw, list] of Object.entries(byRaw)) {
+      const sorted = list.slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+      const names = [];
+      for (const t of sorted) {
+        const n = (t.name || "").trim();
+        if (n && !names.includes(n)) names.push(n);
+      }
+      examples[bank][raw] = names;
+    }
+  }
+
+  const banks = [];
+  const bankIds = new Set([...Object.keys(rawByBank), ...Object.keys(categoryMappings)]);
+  for (const bank of bankIds) {
+    const bankMap = categoryMappings[bank] || {};
+    const raws = rawByBank[bank] || new Set();
+    const unmapped = [...raws].filter(r => !Object.prototype.hasOwnProperty.call(bankMap, r)).sort();
+    const mapped = Object.keys(bankMap).sort().map(raw => ({ raw, value: bankMap[raw] }));
+    if (!unmapped.length && !mapped.length) continue;
+    banks.push({ bank, label: BANK_LABELS[bank] ?? bank, unmapped, mapped });
+  }
+  banks.sort((a, b) => a.label.localeCompare(b.label));
+  return { banks, pendingCounts, examples };
+}
+
+async function updateCategoriesBadge() {
+  const { banks } = await getCategoryData();
+  const count = banks.reduce((sum, b) => sum + b.unmapped.length, 0);
+  const badge = $("categories-badge");
+  badge.textContent = count;
+  badge.style.display = count > 0 ? "" : "none";
+}
+
+function buildCategorySelect(currentValue) {
+  const select = document.createElement("select");
+
+  const choose = document.createElement("option");
+  choose.value = "";
+  choose.textContent = "— choose category —";
+  select.appendChild(choose);
+
+  const blank = document.createElement("option");
+  blank.value = CAT_BLANK;
+  blank.textContent = "Leave uncategorized";
+  select.appendChild(blank);
+
+  for (const cat of [...sureCategories].sort((a, b) => catLabel(a).localeCompare(catLabel(b)))) {
+    const opt = document.createElement("option");
+    opt.value = cat.name;
+    opt.textContent = catLabel(cat);
+    select.appendChild(opt);
+  }
+
+  const create = document.createElement("option");
+  create.value = CAT_CREATE;
+  create.textContent = "+ Create new in Sure…";
+  select.appendChild(create);
+
+  if (currentValue === "") select.value = CAT_BLANK;
+  else if (currentValue != null) select.value = currentValue;
+  else select.value = "";
+  // If the mapped name no longer exists as an option, fall back to placeholder.
+  if (currentValue != null && currentValue !== "" && select.value !== currentValue) select.value = "";
+
+  return select;
+}
+
+function catLabel(cat) {
+  return cat.parent ? `${cat.parent} / ${cat.name}` : cat.name;
+}
+
+async function renderCategoriesView() {
+  const out = $("categories-output");
+  const { banks, pendingCounts, examples } = await getCategoryData();
+
+  out.innerHTML = "";
+  if (!banks.length) {
+    out.innerHTML = '<div class="cat-empty">No categories to map yet. They appear here after a sync finds categories you haven\'t mapped.</div>';
+    return;
+  }
+
+  for (const { bank, label, unmapped, mapped } of banks) {
+    const group = document.createElement("div");
+    group.className = "cat-bank-group";
+
+    const header = document.createElement("div");
+    header.className = "cat-bank-header";
+    header.textContent = label;
+    group.appendChild(header);
+
+    for (const raw of unmapped) {
+      const count = pendingCounts[bank]?.[raw];
+      group.appendChild(buildCategoryRow(bank, raw, undefined, count, true, examples[bank]?.[raw]));
+    }
+
+    if (mapped.length) {
+      const details = document.createElement("details");
+      details.className = "cat-mapped";
+      details.open = expandedMappedBanks.has(bank);
+      details.addEventListener("toggle", () => {
+        if (details.open) expandedMappedBanks.add(bank);
+        else expandedMappedBanks.delete(bank);
+      });
+
+      const summary = document.createElement("summary");
+      summary.textContent = `${mapped.length} mapped`;
+      details.appendChild(summary);
+
+      const wrap = document.createElement("div");
+      wrap.className = "cat-mapped-rows";
+      for (const { raw, value } of mapped) {
+        const count = pendingCounts[bank]?.[raw];
+        wrap.appendChild(buildCategoryRow(bank, raw, value, count, false, examples[bank]?.[raw]));
+      }
+      details.appendChild(wrap);
+      group.appendChild(details);
+    }
+
+    out.appendChild(group);
+  }
+}
+
+function buildCategoryRow(bank, raw, currentValue, pendingCount, isUnmapped, examples) {
+  const row = document.createElement("div");
+  row.className = "cat-row" + (isUnmapped ? " is-unmapped" : "");
+
+  const info = document.createElement("div");
+  info.className = "cat-info";
+
+  const rawEl = document.createElement("div");
+  rawEl.className = "cat-raw";
+  rawEl.textContent = raw;
+  rawEl.title = raw;
+  if (pendingCount) {
+    const countEl = document.createElement("span");
+    countEl.className = "cat-pending-count";
+    countEl.textContent = `${pendingCount} waiting`;
+    rawEl.appendChild(countEl);
+  }
+  info.appendChild(rawEl);
+
+  if (examples?.length) {
+    const exEl = document.createElement("div");
+    exEl.className = "cat-examples";
+    const text = examples.join(" · ");
+    exEl.textContent = text;
+    exEl.title = `${examples.length} name${examples.length === 1 ? "" : "s"}: ${text}`;
+    info.appendChild(exEl);
+  }
+
+  const select = buildCategorySelect(currentValue);
+  let lastValue = select.value;
+  select.addEventListener("change", () => {
+    saveCategoryMapping(bank, raw, select, lastValue).then(() => { lastValue = select.value; });
+  });
+
+  row.appendChild(info);
+  row.appendChild(select);
+  return row;
+}
+
+async function saveCategoryMapping(bank, raw, select, lastValue) {
+  const choice = select.value;
+  let newValue; // undefined = unmap, "" = uncategorized, else Sure category name
+
+  if (choice === CAT_CREATE) {
+    const name = prompt(`New Sure category name for "${raw}":`, raw);
+    if (!name || !name.trim()) { select.value = lastValue; return; }
+    showStatus(`Creating category "${name.trim()}"…`, "");
+    const res = await sendMessage({ type: "CREATE_SURE_CATEGORY", name: name.trim() });
+    if (res.error) {
+      showStatus(`Could not create category: ${res.error}`, "error");
+      select.value = lastValue;
+      return;
+    }
+    sureCategories.push(res.category);
+    await chrome.storage.local.set({ cachedSureCategories: sureCategories });
+    newValue = res.category.name;
+  } else if (choice === CAT_BLANK) {
+    newValue = "";
+  } else if (choice === "") {
+    newValue = undefined; // unmap
+  } else {
+    newValue = choice;
+  }
+
+  await withCategoryMappingLock(async () => {
+    const { categoryMappings = {} } = await chrome.storage.local.get("categoryMappings");
+    const bankMap = { ...(categoryMappings[bank] || {}) };
+    if (newValue === undefined) delete bankMap[raw];
+    else bankMap[raw] = newValue;
+    categoryMappings[bank] = bankMap;
+    await chrome.storage.local.set({ categoryMappings });
+  });
+
+  if (newValue !== undefined) {
+    // Fire-and-forget: the background coalesces flushes and imports the held
+    // transactions, even if a sync or another flush is currently running. The
+    // row's "waiting" count clears via the storage-change re-render when done.
+    await sendMessage({ type: "FLUSH_PENDING_CATEGORIES" });
+    showStatus(`Mapped "${raw}".`, "ok");
+  }
+
+  await renderCategoriesView();
+  await updateCategoriesBadge();
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 $("connect-btn").addEventListener("click", async () => {
@@ -216,6 +511,7 @@ $("connect-btn").addEventListener("click", async () => {
 
     showStatus("Connected. Loading accounts...", "ok");
     await loadSureAccounts();
+    loadSureCategories();
   } catch (err) {
     showStatus(`Connection failed: ${err.message}`, "error");
   } finally {
@@ -483,14 +779,6 @@ function addAccountRow(type, savedMappings) {
   addMappingRow(type, ACCOUNT_TYPES[type].label, savedMappings[type]);
 }
 
-function getBankForKey(key) {
-  if (key.startsWith("sofi-")) return "sofi";
-  if (key.startsWith("capitalone-")) return "capitalone";
-  if (key.startsWith("usbank-")) return "usbank";
-  if (key.startsWith("wf-")) return "wf";
-  return ACCOUNT_TYPES[key]?.bank ?? null;
-}
-
 const BANK_FETCH_FNS = {
   sofi:       addSoFiBanking,
   capitalone: addCapitalOneBanking,
@@ -672,22 +960,25 @@ function addMappingRow(mappingKey, label, selectedId) {
     persistAddedTypes();
     const [
       { accountMappings = {} }, { lastSyncDates = {} }, { lastSyncMetrics = {} }, { syncErrors = {} },
-      { activeSyncSummary = null }, { lastCompletedSyncSummary = null },
+      { lastTxDates = {} }, { activeSyncSummary = null }, { lastCompletedSyncSummary = null }, { pendingCategoryTxns = {} },
     ] = await Promise.all([
       chrome.storage.local.get("accountMappings"),
       chrome.storage.local.get("lastSyncDates"),
       chrome.storage.local.get("lastSyncMetrics"),
       chrome.storage.local.get("syncErrors"),
+      chrome.storage.local.get("lastTxDates"),
       chrome.storage.local.get("activeSyncSummary"),
       chrome.storage.local.get("lastCompletedSyncSummary"),
+      chrome.storage.local.get("pendingCategoryTxns"),
     ]);
-    for (const obj of [accountMappings, lastSyncDates, lastSyncMetrics, syncErrors]) {
+    for (const obj of [accountMappings, lastSyncDates, lastSyncMetrics, syncErrors, lastTxDates, pendingCategoryTxns]) {
       delete obj[mappingKey];
     }
     if (activeSyncSummary?.byKey) delete activeSyncSummary.byKey[mappingKey];
     if (lastCompletedSyncSummary?.byKey) delete lastCompletedSyncSummary.byKey[mappingKey];
-    await chrome.storage.local.set({ accountMappings, lastSyncDates, lastSyncMetrics, syncErrors, activeSyncSummary, lastCompletedSyncSummary });
+    await chrome.storage.local.set({ accountMappings, lastSyncDates, lastSyncMetrics, syncErrors, lastTxDates, activeSyncSummary, lastCompletedSyncSummary, pendingCategoryTxns });
     await renderSyncSummary();
+    await updateCategoriesBadge();
     updateSyncBtn();
   });
 
@@ -719,10 +1010,15 @@ function addMappingRow(mappingKey, label, selectedId) {
       const res = await sendMessage({ type: "DELETE_ALL_TRANSACTIONS", accountId: sureAccountId });
       if (res.error) throw new Error(res.error);
       showStatus(`Deleted ${res.count} transaction${res.count === 1 ? "" : "s"}.`, "ok");
-      const { lastSyncDates = {}, lastSyncMetrics = {} } = await chrome.storage.local.get(["lastSyncDates", "lastSyncMetrics"]);
+      const { lastSyncDates = {}, lastSyncMetrics = {}, lastTxDates = {}, pendingCategoryTxns = {} } =
+        await chrome.storage.local.get(["lastSyncDates", "lastSyncMetrics", "lastTxDates", "pendingCategoryTxns"]);
       delete lastSyncDates[mappingKey];
       delete lastSyncMetrics[mappingKey];
-      await chrome.storage.local.set({ lastSyncDates, lastSyncMetrics });
+      delete lastTxDates[mappingKey];
+      delete pendingCategoryTxns[mappingKey]; // held-back queue is per-account
+      // Category mappings are user-curated config (kept per bank), not sync
+      // state — a re-sync should reuse them, so only Reset wipes them.
+      await chrome.storage.local.set({ lastSyncDates, lastSyncMetrics, lastTxDates, pendingCategoryTxns });
       await loadSureAccounts();
     } catch (err) {
       showStatus(`Delete failed: ${err.message}`, "error");
@@ -1106,6 +1402,12 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
+
+  if (changes.pendingCategoryTxns || changes.categoryMappings) {
+    await updateCategoriesBadge();
+    if ($("categories-view").style.display !== "none") await renderCategoriesView();
+  }
+
   const { accountMappings = {} } = await chrome.storage.local.get("accountMappings");
   if (changes.cachedSofiAccounts) {
     addSoFiBankingRows(changes.cachedSofiAccounts.newValue || [], accountMappings);

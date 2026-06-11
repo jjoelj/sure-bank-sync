@@ -56,8 +56,10 @@ header {
 }
 
 #refresh-btn,
+#categories-btn,
 #logs-btn,
 #settings-btn {
+  position: relative;
   background: transparent;
   border: none;
   color: var(--text-dim);
@@ -69,10 +71,145 @@ header {
 }
 
 #refresh-btn:hover,
+#categories-btn:hover,
 #logs-btn:hover,
 #settings-btn:hover  { color: var(--text); background: var(--border); }
 #settings-btn.active,
+#categories-btn.active,
 #logs-btn.active     { color: var(--accent); }
+
+#categories-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+
+/* ── Categories view ── */
+.cat-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.cat-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+#categories-refresh-btn { padding: 3px 10px; font-size: 12px; }
+
+#categories-output {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 420px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent) transparent;
+}
+
+.cat-empty { color: var(--text-dim); font-style: italic; padding: 8px 2px; }
+
+.cat-bank-group { display: flex; flex-direction: column; gap: 5px; }
+
+.cat-bank-header {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  padding: 2px 2px 0;
+}
+
+.cat-mapped > summary {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 3px 2px;
+  list-style: none;
+  user-select: none;
+}
+
+.cat-mapped > summary::-webkit-details-marker { display: none; }
+.cat-mapped > summary::before { content: "▸ "; }
+.cat-mapped[open] > summary::before { content: "▾ "; }
+.cat-mapped > summary:hover { color: var(--text); }
+
+.cat-mapped-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 5px;
+}
+
+.cat-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(130px, 150px);
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(20, 21, 32, 0.96), rgba(16, 42, 67, 0.58));
+  border: 1px solid var(--border);
+}
+
+.cat-row.is-unmapped { border-color: var(--accent); }
+
+.cat-info {
+  min-width: 0;
+  grid-column: 1;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.cat-raw {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cat-examples {
+  min-width: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-height: 72px;
+  overflow-y: auto;
+}
+
+.cat-pending-count {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-left: 6px;
+}
+
+.cat-row select {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: start;
+}
 
 #sync-btn {
   background: var(--accent);
@@ -107,7 +244,8 @@ header {
 /* ── Views ── */
 #accounts-view,
 #settings-view,
-#logs-view {
+#logs-view,
+#categories-view {
   padding: 12px 14px;
 }
 

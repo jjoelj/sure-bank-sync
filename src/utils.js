@@ -6,7 +6,8 @@ export function subtractOneDay(isoDate) {
     return new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
 }
 
-import { createCsvImport, getTransactions, getLatestTransactionDate } from './sure.js';
+import { createCsvImport, getTransactions, getLatestTransactionDate, getCategories, setTransactionCategory } from './sure.js';
+import { getBankForKey } from './accounts.js';
 
 export function logBalanceDrift(label, sureBalance, addedSum, bankBalance) {
     const expected = sureBalance + addedSum;
@@ -22,7 +23,70 @@ function txFingerprint(tx) {
     return `${tx.date}|${tx.amount}|${tx.payee_name || "Unknown"}`;
 }
 
-export async function importTransactions(label, settings, accountId, transactions, mappingKey) {
+// Category held-back queue fingerprint (includes raw category so two rows that
+// differ only by category aren't collapsed).
+function pendingFingerprint(tx) {
+    return `${tx.date}|${tx.amount}|${tx.payee_name || "Unknown"}|${tx.category || ""}`;
+}
+
+// Split fetched transactions into ones we can import now and ones we hold back
+// because their bank category hasn't been mapped to a Sure category yet. Mapped
+// categories are rewritten to the Sure name (or blank when mapped to ""), and
+// uncategorized rows always import. Held-back rows are queued under their
+// mapping key until flushPendingCategories() picks them up.
+async function applyCategoryMappings(transactions, mappingKey) {
+    const bank = getBankForKey(mappingKey);
+    if (!bank) return { importable: transactions, heldBack: 0 };
+
+    const { categoryMappings = {}, pendingCategoryTxns = {} } =
+        await chrome.storage.local.get(["categoryMappings", "pendingCategoryTxns"]);
+    const bankMap = categoryMappings[bank] || {};
+
+    const importable = [];
+    const newlyHeld = [];
+    for (const tx of transactions) {
+        const raw = tx.category;
+        if (!raw) {
+            importable.push(tx);
+        } else if (Object.prototype.hasOwnProperty.call(bankMap, raw)) {
+            importable.push({ ...tx, category: bankMap[raw] || undefined });
+        } else {
+            newlyHeld.push(tx);
+        }
+    }
+
+    if (newlyHeld.length) {
+        const queue = pendingCategoryTxns[mappingKey] || [];
+        // Count what's already queued by fingerprint so a re-fetched transaction
+        // isn't queued twice — matched 1:1 against the existing queue. Genuinely
+        // identical same-day rows (two transactions sharing a fingerprint) are
+        // both kept rather than collapsed, which a Set would do.
+        const queuedCounts = new Map();
+        for (const tx of queue) {
+            const fp = pendingFingerprint(tx);
+            queuedCounts.set(fp, (queuedCounts.get(fp) || 0) + 1);
+        }
+        for (const tx of newlyHeld) {
+            const fp = pendingFingerprint(tx);
+            const already = queuedCounts.get(fp) || 0;
+            if (already > 0) {
+                queuedCounts.set(fp, already - 1); // re-fetch of one already queued
+            } else {
+                queue.push({ ...tx });
+            }
+        }
+        pendingCategoryTxns[mappingKey] = queue;
+        await chrome.storage.local.set({ pendingCategoryTxns });
+    }
+
+    return { importable, heldBack: newlyHeld.length };
+}
+
+// Import transactions whose categories are already finalized (Sure names or
+// blank): dedup against what's in Sure by fingerprint, then CSV-import the rest.
+// onProgress(fraction, message) reports the upload phase (0 → 1) so the popup
+// can show progress while data is sent to Sure.
+async function importFinalized(label, accountId, transactions, onProgress) {
     if (transactions.length === 0) return { added: 0, addedSum: 0 };
 
     let minDate = transactions[0].date, maxDate = transactions[0].date;
@@ -54,12 +118,124 @@ export async function importTransactions(label, settings, accountId, transaction
         return { added: 0, addedSum: 0 };
     }
 
+    onProgress?.(0, `Uploading ${newTxs.length} to Sure`);
     await createCsvImport(accountId, newTxs);
     await new Promise(r => setTimeout(r, 5000));
+    // Categorizing is the slow part (one PATCH per transaction): give it the
+    // back half of the upload phase so its per-transaction progress is visible.
+    await applyCategories(label, accountId, newTxs, minDate, maxDate, onProgress && ((f, m) => onProgress(0.5 + f * 0.5, m)));
     const addedSum = newTxs.reduce((sum, tx) => sum + tx.amount, 0);
     const skipped = transactions.length - newTxs.length;
     console.log(`${label}: ${transactions.length} total, ${newTxs.length} new via CSV import, ${skipped} already imported`);
     return { added: newTxs.length, addedSum };
+}
+
+// The CSV import API silently drops the category column, so categories are set
+// per transaction afterward via PATCH. Matches each just-imported categorized
+// row to its Sure transaction by fingerprint and assigns the resolved category
+// only when that transaction is still uncategorized — so categories are set on
+// first import and re-syncs never overwrite changes made on the Sure end.
+async function applyCategories(label, accountId, importedTxs, minDate, maxDate, onProgress) {
+    const categorized = importedTxs.filter(t => t.category);
+    if (categorized.length === 0) return;
+
+    let idByName;
+    try {
+        const cats = await getCategories();
+        idByName = new Map(cats.map(c => [c.name, c.id]));
+    } catch (err) {
+        console.warn(`${label}: could not load categories, skipping category assignment:`, err.message);
+        return;
+    }
+
+    const current = await getTransactions(accountId, { startDate: minDate, endDate: maxDate });
+    const byFp = new Map();
+    for (const tx of current) {
+        const fp = sureToFingerprint(tx);
+        if (!byFp.has(fp)) byFp.set(fp, []);
+        byFp.get(fp).push(tx);
+    }
+
+    let applied = 0;
+    for (let i = 0; i < categorized.length; i++) {
+        const tx = categorized[i];
+        onProgress?.(i / categorized.length, `Categorizing ${i + 1}/${categorized.length}`);
+        const categoryId = idByName.get(tx.category);
+        if (!categoryId) {
+            console.warn(`${label}: no Sure category named "${tx.category}", leaving uncategorized.`);
+            continue;
+        }
+        const candidates = byFp.get(txFingerprint(tx)) || [];
+        // Only assign to a still-uncategorized transaction; never overwrite a
+        // category already set in Sure (rules, manual edits, an earlier import).
+        const idx = candidates.findIndex(c => !c.category);
+        if (idx < 0) continue;
+        const match = candidates.splice(idx, 1)[0];
+        try {
+            await setTransactionCategory(match.id, categoryId);
+            applied++;
+        } catch (err) {
+            console.warn(`${label}: failed to set category on ${match.id}:`, err.message);
+        }
+    }
+    if (applied) console.log(`${label}: set category on ${applied} transaction(s).`);
+}
+
+export async function importTransactions(label, settings, accountId, transactions, mappingKey, onProgress) {
+    if (transactions.length === 0) return { added: 0, addedSum: 0 };
+
+    const { importable, heldBack } = await applyCategoryMappings(transactions, mappingKey);
+    if (heldBack > 0) {
+        console.log(`${label}: holding back ${heldBack} transaction(s) with unmapped categories.`);
+    }
+    return importFinalized(label, accountId, importable, onProgress);
+}
+
+// Import queued transactions whose bank category has since been mapped. Runs
+// without a bank tab — it only translates categories and posts to Sure. Returns
+// the number of transactions imported. onProgress(key, fraction, message)
+// reports per-account upload progress; a null message signals that key is done.
+export async function flushPendingCategories(targetKeys, onProgress) {
+    const { categoryMappings = {}, pendingCategoryTxns = {}, accountMappings = {} } =
+        await chrome.storage.local.get(["categoryMappings", "pendingCategoryTxns", "accountMappings"]);
+
+    const keys = targetKeys?.length ? targetKeys : Object.keys(pendingCategoryTxns);
+    let totalAdded = 0;
+    let changed = false;
+
+    for (const key of keys) {
+        const queue = pendingCategoryTxns[key];
+        if (!queue?.length) continue;
+        const accountId = accountMappings[key];
+        if (!accountId) continue;
+        const bankMap = categoryMappings[getBankForKey(key)] || {};
+
+        const ready = [];
+        const remaining = [];
+        for (const tx of queue) {
+            if (Object.prototype.hasOwnProperty.call(bankMap, tx.category)) {
+                ready.push({ ...tx, category: bankMap[tx.category] || undefined });
+            } else {
+                remaining.push(tx);
+            }
+        }
+
+        if (ready.length) {
+            console.log(`Flush ${key}: importing ${ready.length} previously held transaction(s).`);
+            onProgress?.(key, 0, `Importing ${ready.length} mapped`);
+            try {
+                const { added } = await importFinalized(`Flush ${key}`, accountId, ready, onProgress && ((f, m) => onProgress(key, f, m)));
+                totalAdded += added;
+            } finally {
+                onProgress?.(key, null, null); // clear the row's progress when done
+            }
+            pendingCategoryTxns[key] = remaining;
+            changed = true;
+        }
+    }
+
+    if (changed) await chrome.storage.local.set({ pendingCategoryTxns });
+    return { added: totalAdded };
 }
 
 export function getDateChunks(startDate, endDate, maxDays) {
@@ -107,6 +283,19 @@ export function isoDate(date) {
 
 export function pacificDate(date) {
     return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(date);
+}
+
+export function toLocalDate(timestamp) {
+    if (timestamp == null) return null;
+    if (typeof timestamp === "number") {
+        const d = new Date(timestamp);
+        return Number.isNaN(d.getTime()) ? null : pacificDate(d);
+    }
+    const str = String(timestamp);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+    const parsed = new Date(str);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return pacificDate(parsed);
 }
 
 export function offsetDate(isoStr, days) {

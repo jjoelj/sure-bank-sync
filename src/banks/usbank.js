@@ -1,4 +1,4 @@
-import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, toLocalDate, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncUSBank(settings, accountMappings, options = {}) {
     console.log("US Bank: starting");
@@ -85,7 +85,8 @@ export async function syncUSBank(settings, accountMappings, options = {}) {
             if (transactions.length > 0) {
                 reportProgress(options, mappingKey, 80, `Importing ${transactions.length} transactions`);
                 console.log(`US Bank ${account.name}: importing ${transactions.length} transactions.`);
-                ({ addedSum } = await importTransactions(`US Bank ${account.name}`, settings, sureAccountId, transactions, mappingKey));
+                ({ addedSum } = await importTransactions(`US Bank ${account.name}`, settings, sureAccountId, transactions, mappingKey,
+                    (frac, msg) => reportProgress(options, mappingKey, 80 + Math.round(frac * 20), msg)));
             } else {
                 console.log(`US Bank ${account.name}: no new transactions.`);
             }
@@ -178,6 +179,7 @@ function pollForUSBankData(tabId, onTick) {
 
 async function fetchUSBankTransactions(tabId, accessToken, afToken, accountToken, startDate, endDate) {
     const allTransactions = [];
+    const seen = new Set();
     let pageNumber = 1;
 
     while (true) {
@@ -192,10 +194,15 @@ async function fetchUSBankTransactions(tabId, accessToken, afToken, accountToken
         });
         if (result.error) throw new Error(result.error);
 
+        let added = 0;
         for (const tx of result.transactions) {
-            const rawDate = tx.postedDateTime;
-            if (!rawDate) continue;
-            const date = rawDate.slice(0, 10);
+            const key = tx.transactionUniqueId || `${tx.postedDateTime}|${tx.transactionAmount}|${tx.description}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            added++;
+
+            const date = toLocalDate(tx.postedDateTime);
+            if (!date) continue;
 
             const amount = Math.round(tx.transactionAmount * 100);
             const isCredit = tx.debitCreditMemo?.toUpperCase()?.startsWith("C");
@@ -205,11 +212,11 @@ async function fetchUSBankTransactions(tabId, accessToken, afToken, accountToken
                 date,
                 amount: signedAmount,
                 payee_name: tx.description?.trim(),
-                notes: tx.enrichedDetails?.category || undefined,
+                category: tx.enrichedDetails?.category || undefined,
             });
         }
 
-        if (pageNumber >= (result.totalPages || 1)) break;
+        if (pageNumber >= (result.totalPages || 1) || added === 0) break;
         pageNumber++;
     }
 

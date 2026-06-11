@@ -53,6 +53,36 @@ export async function getAccounts() {
   });
 }
 
+export async function getCategories() {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const data = await apiFetch(`/categories?page=${page}&per_page=100`);
+    all.push(...data.categories);
+    if (page >= data.pagination.total_pages) break;
+    page++;
+  }
+  return all.map(c => ({ id: c.id, name: c.name, parent: c.parent?.name ?? null }));
+}
+
+export async function createCategory(name) {
+  const data = await apiFetch("/categories", {
+    method: "POST",
+    body: JSON.stringify({ category: { name } }),
+  });
+  return { id: data.id, name: data.name, parent: data.parent?.name ?? null };
+}
+
+// Set a transaction's category. The CSV import API ignores the category column
+// (it never builds the import mappings that resolve category names), so
+// categories are applied here per transaction after the import completes.
+export async function setTransactionCategory(transactionId, categoryId) {
+  return apiFetch(`/transactions/${transactionId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ transaction: { category_id: categoryId } }),
+  });
+}
+
 export async function createCsvImport(accountId, transactions) {
   const header = "date,amount,name,notes";
   const rows = transactions.map(tx => {

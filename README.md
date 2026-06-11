@@ -30,6 +30,14 @@ Transactions are imported via Sure's CSV import API (`POST /api/v1/imports` with
 
 Deduplication is handled client-side by fingerprinting each transaction (date + amount + name) against existing transactions in Sure. After each import, the extension polls the import status until Sure finishes processing before moving on to the next account.
 
+## Categories
+
+Each bank's category for a transaction is mapped to a Sure category before import. Mappings are kept per bank in the extension (raw bank category → Sure category).
+
+When a sync encounters a bank category that hasn't been mapped yet, those transactions are **held back** rather than imported — they're queued locally and the **🏷 Categories** view (badge shows the count of unmapped categories) lists them. Map each one to a Sure category (or "Leave uncategorized", or create a new Sure category on the spot) and the held transactions are imported immediately. The next sync also flushes anything that became mappable in the meantime.
+
+Sure's CSV import API ignores the category column (it never builds the category mappings the web UI uses), so categories are applied per transaction via the transactions API (`PATCH /api/v1/transactions/{id}`) right after each import. Mapping a bank category therefore targets an existing Sure category — pick one from the dropdown, or use "+ Create new in Sure…" to create it on the spot. Uncategorized bank transactions import normally without waiting.
+
 ## Transfers
 
 Transfers are imported as regular transactions. To have Sure recognize them as transfers between accounts, set up rules in Sure that match the transfer transaction names and convert them accordingly. Without rules, transfers appear as separate income/expense entries on each account.

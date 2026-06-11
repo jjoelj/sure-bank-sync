@@ -53,7 +53,8 @@ export async function syncCapitalOne(settings, accountMappings, options = {}) {
             if (transactions.length > 0) {
                 reportProgress(options, mappingKey, 80, `Importing ${transactions.length} transactions`);
                 console.log(`Capital One ${account.name}: importing ${transactions.length} transactions.`);
-                ({ addedSum } = await importTransactions(`Capital One ${account.name}`, settings, sureAccountId, transactions, mappingKey));
+                ({ addedSum } = await importTransactions(`Capital One ${account.name}`, settings, sureAccountId, transactions, mappingKey,
+                    (frac, msg) => reportProgress(options, mappingKey, 80 + Math.round(frac * 20), msg)));
             } else {
                 console.log(`Capital One ${account.name}: no new transactions.`);
             }
@@ -202,7 +203,7 @@ async function fetchCapitalOneTransactions(accountId, startDate, endDate) {
             let amount = Math.round(tx.transactionAmount * 100) * (isCredit ? 1 : -1);
             let category = tx.displayCategory;
 
-            let idx = allTransactions.findIndex(t => t.date === date && t.amount === amount && t.notes === category.trim());
+            let idx = allTransactions.findIndex(t => t.date === date && t.amount === amount && t.category === category.trim());
             if (idx >= 0) {
                 console.log("Removing duplicate pending transaction from today");
                 allTransactions.splice(idx, 1);
@@ -240,7 +241,7 @@ function parseCapitalOneCsv(csv) {
             date,
             amount,
             payee_name: description.trim(),
-            notes: category.trim(),
+            category: category.trim(),
         });
     }
 
