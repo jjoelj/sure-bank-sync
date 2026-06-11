@@ -1,4 +1,4 @@
-import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, parseCsvLine, POLL_TIMEOUT_MS, POLL_INTERVAL_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, getDateChunks, logBalanceDrift, onTabClose } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, toLocalDate, openTabBackground, POLL_TIMEOUT_MS, POLL_INTERVAL_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, getDateChunks, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncBilt(settings, accountMappings, accountKey, options = {}) {
     console.log("Bilt: starting");
@@ -46,7 +46,7 @@ export async function syncBilt(settings, accountMappings, accountKey, options = 
                     accessToken: biltData.accessToken,
                 });
                 if (fetchResult.error) throw new Error(fetchResult.error);
-                transactions.push(...parseBiltCsv(fetchResult.data));
+                transactions.push(...mapBiltTransactions(fetchResult.transactions));
             }
         } catch (err) {
             console.error("Bilt fetch failed:", err.message);
@@ -72,7 +72,8 @@ export async function syncBilt(settings, accountMappings, accountKey, options = 
     if (transactions.length > 0) {
         reportProgress(options, 80, `Importing ${transactions.length} transactions`);
         console.log(`Bilt: importing ${transactions.length} transactions.`);
-        ({ addedSum } = await importTransactions("Bilt", settings, sureAccountId, transactions, accountKey));
+        ({ addedSum } = await importTransactions("Bilt", settings, sureAccountId, transactions, accountKey,
+            (frac, msg) => reportProgress(options, 80 + Math.round(frac * 20), msg)));
     } else {
         console.log("Bilt: no new transactions.");
     }
@@ -117,27 +118,21 @@ function pollForBiltData(tabId, onTick) {
     });
 }
 
-function parseBiltCsv(csv) {
-    const lines = csv.trim().split("\n");
-    if (lines.length < 2) return [];
-
+function mapBiltTransactions(rawTransactions) {
     const transactions = [];
 
-    for (let i = 1; i < lines.length; i++) {
-        const cols = parseCsvLine(lines[i]);
-        // Transaction Date,Posted Date,Description,Amount,Card Last 4,Name on Card,Raw Merchant Name
-        const [txDate, postedDate, description, amountStr] = cols;
+    for (const tx of rawTransactions || []) {
+        const date = toLocalDate(tx.updatedAt);
+        const amountNum = parseFloat(tx.amount?.amount);
+        if (!date || Number.isNaN(amountNum)) continue;
 
-        if (!amountStr || !txDate) continue;
-
-        const amount = Math.round(parseFloat(amountStr) * 100) * -1;
-        if (!postedDate || !postedDate.trim()) continue;
-        const date = postedDate.trim();
+        const payee = tx.description || tx.merchant?.name || "Unknown";
 
         transactions.push({
             date,
-            amount,
-            payee_name: description.trim(),
+            amount: Math.round(amountNum * 100) * -1,
+            payee_name: typeof payee === "string" ? payee.trim() : "Unknown",
+            category: tx.merchant?.category || tx.displayCategory || undefined,
         });
     }
 

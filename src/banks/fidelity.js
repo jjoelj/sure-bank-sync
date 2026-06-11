@@ -1,4 +1,4 @@
-import { getSyncPlan, seedLastTxDates, pacificDate, openTabBackground, parseCsvLine, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, pacificDate, toLocalDate, getDateChunks, openTabBackground, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncFidelity(settings, accountMappings, accountKey, options = {}) {
     console.log("Fidelity: starting");
@@ -22,7 +22,7 @@ export async function syncFidelity(settings, accountMappings, accountKey, option
     chrome.windows.update(tab.windowId, { focused: true });
 
     let fidelityData;
-    let csvData;
+    let rawTransactions;
 
     try {
         try {
@@ -36,15 +36,25 @@ export async function syncFidelity(settings, accountMappings, accountKey, option
 
         try {
             reportProgress(options, 55, "Fetching transactions");
-            const result = await chrome.tabs.sendMessage(tab.id, {
-                type: "FETCH_FIDELITY_TRANSACTIONS",
-                accessToken: fidelityData.accessToken,
-                accountToken: fidelityData.accountToken,
-                startDate,
-                endDate: todayStr,
-            });
-            if (result.error) throw new Error(result.error);
-            csvData = result.data;
+            const chunks = getDateChunks(startDate, todayStr, 90);
+            const seen = new Set();
+            rawTransactions = [];
+            for (const [chunkStart, chunkEnd] of chunks) {
+                const result = await chrome.tabs.sendMessage(tab.id, {
+                    type: "FETCH_FIDELITY_TRANSACTIONS",
+                    accessToken: fidelityData.accessToken,
+                    accountToken: fidelityData.accountToken,
+                    startDate: chunkStart,
+                    endDate: chunkEnd,
+                });
+                if (result.error) throw new Error(result.error);
+                for (const tx of result.transactions) {
+                    const key = tx.transactionUniqueId || `${tx.transactionDateTime}|${tx.transactionAmount}|${tx.description}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    rawTransactions.push(tx);
+                }
+            }
         } catch (err) {
             console.error("Fidelity fetch failed:", err.message);
             return;
@@ -61,13 +71,14 @@ export async function syncFidelity(settings, accountMappings, accountKey, option
     }
 
     try {
-        const transactions = parseFidelityCsv(csvData);
+        const transactions = mapFidelityTransactions(rawTransactions);
         const sureBalance = currentBalance != null ? (options.sureBalances?.[sureAccountId] ?? null) : null;
         let addedSum = 0;
         if (transactions.length > 0) {
             reportProgress(options, 80, `Importing ${transactions.length} transactions`);
             console.log(`Fidelity: importing ${transactions.length} transactions.`);
-            ({ addedSum } = await importTransactions("Fidelity", settings, sureAccountId, transactions, accountKey));
+            ({ addedSum } = await importTransactions("Fidelity", settings, sureAccountId, transactions, accountKey,
+                (frac, msg) => reportProgress(options, 80 + Math.round(frac * 20), msg)));
         } else {
             console.log("Fidelity: no new transactions.");
         }
@@ -229,31 +240,29 @@ function pollForFidelityData(tabId, onTick) {
     });
 }
 
-function parseFidelityCsv(csv) {
-    const lines = csv.trim().split("\n");
-    if (lines.length < 2) return [];
+function mapFidelityTransactions(rawTransactions) {
+    const mapped = [];
 
-    const transactions = [];
+    for (const tx of rawTransactions || []) {
+        if (tx.pendingFlag || tx.transactionStatus === "PENDING") continue;
 
-    for (let i = 1; i < lines.length; i++) {
-        const cols = parseCsvLine(lines[i]);
-        // "Date","Transaction","Name","Memo","Amount"
-        const date = cols[0]?.replace(/"/g, "").trim();
-        const transaction = cols[1]?.replace(/"/g, "").trim();
-        const name = cols[2]?.replace(/"/g, "").trim();
-        const amountStr = cols[4]?.replace(/"/g, "").trim();
+        const date = toLocalDate(tx.transactionDateTime || tx.effectiveDate || tx.postedDateTime);
+        const rawAmount = parseFloat(tx.transactionAmount);
+        if (!date || Number.isNaN(rawAmount)) continue;
 
-        if (!date || !amountStr) continue;
+        const sign = String(tx.debitCredit).toUpperCase() === "CREDIT" ? 1 : -1;
+        const amount = Math.round(rawAmount * 100) * sign;
+        const payee_name = tx.description || tx.merchantDetails?.name || "Unknown";
+        const category = tx.enrichedDetails?.category || undefined;
 
-        const amount = Math.round(parseFloat(amountStr) * 100);
-
-        transactions.push({
-            date,
-            amount,
-            notes: transaction,
-            payee_name: name,
-        });
+        mapped.push({ date, amount, payee_name, category, fp: `${date}|${amount}|${payee_name}`, hasCategory: Boolean(category) });
     }
 
-    return transactions;
+    // ELAN returns an enriched (categorized) and a non-enriched copy of each
+    // transaction with different IDs; drop the non-enriched twin when a
+    // categorized one exists, keeping genuinely uncategorized rows.
+    const categorizedFps = new Set(mapped.filter(t => t.hasCategory).map(t => t.fp));
+    return mapped
+        .filter(t => t.hasCategory || !categorizedFps.has(t.fp))
+        .map(({ date, amount, payee_name, category }) => ({ date, amount, payee_name, category }));
 }
