@@ -42,7 +42,9 @@ Sure's CSV import API ignores the category column (it never builds the category 
 
 Transfers are imported as regular transactions. To have Sure recognize them as transfers between accounts, set up rules in Sure that match the transfer transaction names and convert them accordingly. Without rules, transfers appear as separate income/expense entries on each account.
 
-SoFi shows both sides of every internal transfer (e.g., "To Savings" on checking and "From Checking" on savings). The extension filters out the incoming side ("From Checking", "From Savings", "From [Vault] Vault", etc.) to avoid double-counting. Only the outgoing side ("To ...") is imported.
+SoFi shows both sides of every internal transfer (e.g., "To Savings" on checking and "From Checking" on savings). The extension drops the incoming "From …" side only when it can pair it with a matching outgoing "To …" in another account — same date, opposite amount, since SoFi posts both sides instantly. The outgoing "To …" side is kept and imported, so the transfer isn't double-counted. A "From …" with no matching "To …" (e.g. the other account has no Sure mapping) is treated as a real inflow and kept.
+
+To make the pairing reliable, SoFi banking accounts (checking, savings, vaults) are synced **as a group**: whenever a SoFi sync runs — even from a single account row — every mapped banking account is fetched over one window (the earliest pending start date) so both sides of a transfer always arrive together. Accounts without a Sure mapping are never imported, and re-fetched transactions that already exist in Sure are deduplicated on import. The credit card syncs on its own and isn't part of this pairing.
 
 ## Managing Transactions
 
