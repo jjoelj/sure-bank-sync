@@ -1,4 +1,4 @@
-import { getSyncPlan, seedLastTxDates, parseCsvLine, openTabBackground, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, logBalanceDrift, onTabClose } from "../utils.js";
+import { getSyncPlan, seedLastTxDates, parseCsvLine, toLocalDate, openTabBackground, reportProgress, updateLastSyncDate, updateLastSyncStats, importTransactions, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, logBalanceDrift, onTabClose } from "../utils.js";
 
 export async function syncVenmo(settings, accountMappings, options = {}) {
     console.log("Venmo: starting");
@@ -54,25 +54,33 @@ export async function syncVenmo(settings, accountMappings, options = {}) {
         console.log(`Venmo sync: ${cashStart} → ${today}`);
         try {
             reportProgress(options, "venmo-cash", 55, "Fetching transactions");
-            const { transactions, walletTransactions, endingBalance } = await fetchVenmoTransactions(venmoData.profileId, cashStart, today);
+            const { transactions, walletTransactions, endingBalance } = await fetchVenmoTransactions(
+                venmoData.profileId, cashStart, today,
+                (attempt, max) => reportProgress(options, "venmo-cash", 55, `Statement generating, retry ${attempt}/${max}…`),
+            );
             const sureBalance = endingBalance != null ? (options.sureBalances?.[cashAccountId] ?? null) : null;
             let addedSum = 0;
             if (transactions.length > 0) {
                 reportProgress(options, "venmo-cash", 80, `Importing ${transactions.length} transactions`);
                 console.log(`Venmo: importing ${transactions.length} transactions.`);
-                ({ addedSum } = await importTransactions("Venmo", settings, cashAccountId, transactions, "venmo-cash"));
+                ({ addedSum } = await importTransactions("Venmo", settings, cashAccountId, transactions, "venmo-cash",
+                    (frac, msg) => reportProgress(options, "venmo-cash", 80 + Math.round(frac * 20), msg)));
             } else {
                 console.log("Venmo: no new transactions.");
             }
             if (sureBalance != null) logBalanceDrift("Venmo", sureBalance, addedSum, endingBalance);
             await updateLastSyncStats("venmo-cash", transactions);
+            // Only advance the watermark and clear the error on a real result, so
+            // a deferred/failed fetch is retried next sync rather than skipped.
+            await updateLastSyncDate("venmo-cash", today);
+            await clearSyncError("venmo-cash");
 
             reportProgress(options, "venmo-cash", 100, transactions.length ? `Imported ${transactions.length}` : "No new transactions");
         } catch (err) {
             console.error("Venmo failed:", err.message);
+            await setSyncError("venmo-cash", err.message);
+            reportProgress(options, "venmo-cash", 100, "Sync failed");
         }
-        await updateLastSyncDate("venmo-cash", today);
-        await clearSyncError("venmo-cash");
     }
 
     if (needsCredit) {
@@ -93,7 +101,8 @@ export async function syncVenmo(settings, accountMappings, options = {}) {
             if (transactions.length > 0) {
                 reportProgress(options, "venmo-credit", 80, `Importing ${transactions.length} transactions`);
                 console.log(`Venmo Credit: importing ${transactions.length} transactions.`);
-                ({ addedSum } = await importTransactions("Venmo Credit", settings, creditAccountId, transactions, "venmo-credit"));
+                ({ addedSum } = await importTransactions("Venmo Credit", settings, creditAccountId, transactions, "venmo-credit",
+                    (frac, msg) => reportProgress(options, "venmo-credit", 80 + Math.round(frac * 20), msg)));
             } else {
                 console.log("Venmo Credit: no new transactions.");
             }
@@ -231,14 +240,34 @@ function pollForVenmoData(tabId, { needsProfileId, needsBearerToken }, onTick) {
     });
 }
 
-async function fetchVenmoTransactions(profileId, startDate, endDate) {
-    const url = `https://account.venmo.com/api/statement/download?startDate=${startDate}&endDate=${endDate}&csv=true&profileId=${profileId}&accountType=personal`;
-    console.log("Venmo: fetching", url);
-    const response = await fetch(url, { credentials: "include" });
-    if (!response.ok) throw new Error(`Venmo export failed: ${response.status}`);
+const VENMO_STATEMENT_MAX_ATTEMPTS = 10;
+const VENMO_STATEMENT_RETRY_MS = 10000;
 
-    const csv = await response.text();
-    return parseVenmoCsv(csv, startDate, endDate);
+async function fetchVenmoTransactions(profileId, startDate, endDate, onRetry) {
+    const url = `https://account.venmo.com/api/statement/download?startDate=${startDate}&endDate=${endDate}&csv=true&profileId=${profileId}&accountType=personal`;
+
+    // For larger ranges Venmo builds the statement asynchronously and returns an
+    // empty body until the file is ready (and emails it separately). Retrying the
+    // same download eventually returns the real CSV, so poll until it does. Any
+    // non-empty body is the actual statement — a genuinely empty statement still
+    // includes the header and balance rows — so an empty body is the only
+    // "not ready yet" signal.
+    for (let attempt = 1; attempt <= VENMO_STATEMENT_MAX_ATTEMPTS; attempt++) {
+        console.log(`Venmo: fetching${attempt > 1 ? ` (attempt ${attempt}/${VENMO_STATEMENT_MAX_ATTEMPTS})` : ""}`, url);
+        const response = await fetch(url, { credentials: "include" });
+        if (!response.ok) throw new Error(`Venmo export failed: ${response.status}`);
+
+        const csv = await response.text();
+        if (csv.trim()) return parseVenmoCsv(csv, startDate, endDate);
+
+        console.warn(`Venmo: empty statement response (attempt ${attempt}/${VENMO_STATEMENT_MAX_ATTEMPTS}), not ready yet. Retrying…`);
+        if (attempt < VENMO_STATEMENT_MAX_ATTEMPTS) {
+            onRetry?.(attempt, VENMO_STATEMENT_MAX_ATTEMPTS);
+            await new Promise(r => setTimeout(r, VENMO_STATEMENT_RETRY_MS));
+        }
+    }
+
+    throw new Error(`Venmo statement still empty after ${VENMO_STATEMENT_MAX_ATTEMPTS} attempts.`);
 }
 
 function parseVenmoCsv(csv, startDate, endDate) {
@@ -336,7 +365,7 @@ async function fetchVenmoCreditTransactions(bearerToken, startDate, endDate) {
 
         let reachedStart = false;
         for (const tx of page) {
-            const date = tx.created_at?.split("T")[0];
+            const date = toLocalDate(tx.created_at);
             if (!date) continue;
             if (date > endDate) continue;
             if (date < startDate) { reachedStart = true; break; }
@@ -349,6 +378,7 @@ async function fetchVenmoCreditTransactions(bearerToken, startDate, endDate) {
                 date,
                 amount,
                 payee_name: payee,
+                category: tx.merchant?.category?.name || undefined,
             });
         }
 
