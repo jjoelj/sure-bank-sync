@@ -70,7 +70,8 @@ export async function syncTarget(settings, accountMappings, accountKey, options 
         if (transactions.length > 0) {
             reportProgress(options, 80, `Importing ${transactions.length} transactions`);
             console.log(`Target: importing ${transactions.length} transactions.`);
-            ({ addedSum } = await importTransactions("Target", settings, sureAccountId, transactions, accountKey));
+            ({ addedSum } = await importTransactions("Target", settings, sureAccountId, transactions, accountKey,
+                (frac, msg) => reportProgress(options, 80 + Math.round(frac * 20), msg)));
         } else {
             console.log("Target: no new transactions.");
         }
@@ -182,11 +183,15 @@ function parseTargetTransactions(data) {
     }).map(tx => {
         const amount = Math.round(tx.transactionAmount * 100) * -1;
 
+        const cardMasked = tx.transactedPresentationInstrumentIdentifier?.maskedValue
+            || tx.transactionAccountNumber?.maskedValue;
+        const cardLast4 = cardMasked?.slice(-4);
+
         return {
             date: tx.transactionDate,
             amount,
             payee_name: tx.description?.trim(),
-            notes: tx.transactionCode?.display,
+            notes: cardLast4 ? `**${cardLast4}` : undefined,
         };
     });
 }
